@@ -3,7 +3,39 @@
 Combine sensor data from multiple ZIP files (each containing CSVs, possibly in
 nested folders) into one clean `combined.csv`.
 
-## Usage
+## Web UI (Streamlit, localhost)
+
+`app.py` is a localhost web UI for the same pipeline; all cleaning/combining
+logic lives in `processor.py` (UI-free), and `combine_sensor_data.py` reuses it
+for command-line batch runs.
+
+Upload one or more ZIP files, choose duplicate handling
+(**keep last** default / keep first / keep all, keyed on
+`timestamp + kind + area`), press **Process**, preview the combined table and
+download `combined.csv`. The summary shows ZIPs processed, CSVs found, rows
+read/kept/dropped plus errors & warnings.
+
+### Run instructions
+
+For Windows:
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+streamlit run app.py --server.port 8501
+```
+
+For Mac/Linux:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py --server.port 8501
+```
+
+Then open http://localhost:8501 in a browser.
+
+## Command line
 
 ```bash
 python combine_sensor_data.py <input_folder_with_zips> [output_dir]
