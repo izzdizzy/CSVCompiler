@@ -248,6 +248,19 @@ class ProgressTracker:
         self._samples = deque(maxlen=self.MOVING_WINDOW)
         self._last_time = self.started_at
 
+        # Weighted overall progress (Validation mode): when set, the primary
+        # bar follows this value instead of raw files_done/total_files.  The
+        # validation engine combines per-file completion with fixed pipeline
+        # stages (load/index/compare/report) into one monotonic fraction.
+        self._weighted = None
+        self._val_scan_span = 0.86       # validation-mode scan share
+        self._val_stage_base = 0.0       # accumulated fixed-stage weight
+        # When True, finish_file() also refreshes the weighted fraction
+        # (files_done / total_files).  Enabled by the Validation engine so
+        # its live bar is driven by SOURCE FILE completion; the Process-tab
+        # pipeline leaves this False and keeps pure file-count behaviour.
+        self._weight_on_file_finish = False
+
         # Most recent non-zero ETA estimate + its basis — kept so the UI can
         # report "estimated time accuracy" after the run finishes.
         self.last_eta_seconds = None
@@ -307,6 +320,13 @@ class ProgressTracker:
             self._last_time = now
             self.current_rows = 0
             self.last_file_status = status
+            # Weighted mode (Validation engine): keep the blended fraction in
+            # sync with real file completion after every finished file.
+            if self._weight_on_file_finish and self._total_files:
+                f = (min(self.files_done / self._total_files, 1.0)
+                     * self._val_scan_span)
+                if self._weighted is None or f > self._weighted:
+                    self._weighted = f
             # Once every file is done there is nothing left to estimate —
             # drop any stale ETA so the UI shows a clean finishing state.
             if self._total_files and self.files_done >= self._total_files:
@@ -317,6 +337,70 @@ class ProgressTracker:
         with self._lock:
             if total_rows and total_rows >= self.rows_seen:
                 self._total_rows_hint = int(total_rows)
+
+    # -- weighted progress mode (used by the Validation / Compare engine) --
+    def enable_weighted_progress(self, scan_span: float = 0.86):
+        """Switch this tracker into Validation-engine weighted mode.
+
+        * ``scan_span`` — share of the overall bar owned by source-file
+          scanning; completed files map onto ``files_done/total_files *
+          scan_span`` of the blended fraction.
+        * The remaining ``(1 - scan_span)`` is distributed across the fixed
+          pipeline stages via :meth:`set_weighted_stage` calls from the
+          engine (load combined CSV / index combined CSV / compare rows /
+          generate report).
+        Must be called BEFORE any file finishes so the first tick already
+        uses weighted semantics.
+        """
+        with self._lock:
+            self._weight_on_file_finish = True
+            self._val_scan_span = max(0.0, min(float(scan_span), 1.0))
+            self._val_stage_base = 0.0   # accumulated fixed-stage weight
+
+    def set_weighted_stage(self, weight: float):
+        """Add a fixed stage's weight to the blended progress and refresh it."""
+        with self._lock:
+            self._val_stage_base = min(self._val_stage_base + max(0.0, float(weight)),
+                                       1.0 - getattr(self, "_val_scan_span", 0.86))
+            f = self._val_stage_base
+            if self._weight_on_file_finish and self._total_files:
+                f += (min(self.files_done / self._total_files, 1.0)
+                      * self._val_scan_span)
+            else:
+                # No file total yet -> show half the scan span as in-progress.
+                f += self._val_scan_span * 0.5
+            if self._weighted is None or f > self._weighted:
+                self._weighted = min(f, 1.0)
+
+    def set_total_files(self, total_files: int):
+        """Publish the exact number of work units (source CSV files)."""
+        with self._lock:
+            self._total_files = max(int(total_files or 0), 0)
+            if self._weight_on_file_finish and self._total_files:
+                f = (self._val_stage_base
+                     + min(self.files_done / self._total_files, 1.0)
+                     * self._val_scan_span)
+                if self._weighted is None or f > self._weighted:
+                    self._weighted = min(f, 1.0)
+
+    def set_weighted_progress(self, fraction: float):
+        """Set the progress bar directly from a *weighted overall fraction*.
+
+        The validation pipeline's work units are source CSV files, but it
+        also has fixed non-file stages (loading/indexing the combined CSV,
+        comparing rows, generating the report).  Those stages publish their
+        combined completion here; the value is monotonically clamped so the
+        bar never moves backwards.  ETA keeps using the per-file timing
+        samples recorded via ``finish_file()``.
+        """
+        with self._lock:
+            f = max(0.0, min(float(fraction), 1.0))
+            if self._weighted is None or f > self._weighted:
+                self._weighted = f
+
+    def finish_all_files(self):
+        """Force the weighted progress to 100% (terminal state of a run)."""
+        self.set_weighted_progress(1.0)
 
     def stage(self, msg: str):
         """Publish a visible log line for the final combining/export stage.
@@ -382,14 +466,37 @@ class ProgressTracker:
                 fraction = 1.0
                 eta = 0.0 if basis else None
 
+            # ---- weighted mode (Validation / Compare) ---------------------
+            # When the engine publishes a weighted overall fraction (file
+            # completion blended with fixed pipeline stages), the bar follows
+            # it; the ETA stays per-file based but accounts for the remaining
+            # fixed-stage share so it never under-estimates the tail.
+            if self._weighted is not None:
+                fraction = max(fraction or 0.0, self._weighted)
+                if all_files_done and self._weighted < 1.0:
+                    # Files done but comparing/reporting still pending: keep
+                    # an indeterminate-but-moving bar instead of lying at 100%.
+                    fraction = self._weighted
+                if eta is not None or self._weighted < 1.0:
+                    if avg_spf is not None and avg_spf > 0 and not all_files_done:
+                        remaining_share = max(1.0 - self._weighted, 0.0)
+                        eta = max(remaining_share * self._total_files * avg_spf, 0.0) \
+                            if self._total_files else None
+                    elif all_files_done:
+                        eta = 0.0
+                if self._weighted >= 1.0:
+                    fraction = 1.0
+                    eta = 0.0
+
             # Remember the last meaningful ETA for the post-run accuracy note.
             if eta is not None and eta > 0:
                 self.last_eta_seconds = eta
-                self.last_eta_basis = basis
+                self.last_eta_basis = basis or "files"
 
             return {
                 "elapsed": elapsed,
                 "fraction": fraction,          # None => indeterminate progress
+                "weighted": self._weighted is not None,  # Validation mode flag
                 "eta_seconds": eta,            # None => cannot estimate yet
                 "eta_basis": basis,
                 "avg_seconds_per_file": avg_spf,
