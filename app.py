@@ -123,20 +123,27 @@ def _manual_validation_worker(combined_uploads, zip_items, tolerance, tracker):
         st.session_state["manual_val_done"] = True
 
 
-def _render_progress(tracker):
+def _render_progress(tracker, prefix: str = "_pb", show_final_stage: bool = True):
     """Draw one frame of the live progress UI from a tracker snapshot.
 
     Returns the snapshot dict so callers can inspect terminal conditions.
-    Uses pre-created placeholder containers so repeated repaints don't grow
-    the page.  The primary bar is FILE-COMPLETION based (completed files /
-    total files); rows are secondary info only.
+    Uses pre-created placeholder containers (stored under session_state keys
+    ``{prefix}_bar`` etc.) so repeated repaints don't grow the page.  The
+    primary bar is FILE-COMPLETION based (completed files / total files);
+    rows are secondary info only.
+
+    IMPORTANT (UI text rules): all multi-line markdown below uses REAL "\\\\n"
+    escape sequences handled by ``st.markdown`` — never literal backslash-n
+    text, which would render visibly as "\\n" instead of breaking lines.
+    `show_final_stage=False` skips the final-stage box for callers that
+    render their own dedicated final-stage status area (Validation tab).
     """
     snap = tracker.snapshot()
-    bar = st.session_state["_pb_bar"]
-    txt = st.session_state["_pb_text"]
-    cur = st.session_state["_pb_current"]
-    rows = st.session_state["_pb_rows"]
-    stage_box = st.session_state["_pb_stage"]
+    bar = st.session_state[f"{prefix}_bar"]
+    txt = st.session_state[f"{prefix}_text"]
+    cur = st.session_state[f"{prefix}_current"]
+    rows = st.session_state[f"{prefix}_rows"]
+    stage_box = st.session_state[f"{prefix}_stage"]
 
     fraction = snap["fraction"]
     done = snap["files_done"]
@@ -152,33 +159,34 @@ def _render_progress(tracker):
                      text=(f"Files completed: **{done} of {total_files}**{pct_txt}"))
 
     # ---- Live status line: elapsed / ETA (avg time per file) ----
-    parts = [f"🧾 Completed files: **{done}/{total_files or '?'}**",
+    parts = [f"🧾 Files completed: **{done} of {total_files or '?'}**",
              f"✅ {fraction * 100:.1f}% complete" if fraction is not None
              else "⏳ Estimating…"]
     parts.append(f"⏱️ Elapsed **{format_duration(snap['elapsed']) or '0s'}**")
     if snap["eta_seconds"] is not None:
         spf = snap.get("avg_seconds_per_file")
-        spf_txt = f" (avg {spf:.1f}s/file)" if spf else ""
+        spf_txt = f" | avg {spf:.1f}s/file" if spf else ""
         parts.append(f"🔮 ETA **{format_duration(snap['eta_seconds'])}**{spf_txt}")
     else:
         parts.append("🔮 ETA calculating… (needs ≥1 finished file)")
     txt.markdown("  |  ".join(parts))
 
     # ---- Current file line (+ last file's success/failure status) ----
+    # NOTE: real newline characters here — Streamlit renders them as line
+    # breaks (the old double-backslash version showed literal "\\n" text).
     status_icons = {"ok": "✅ ok", "skipped": "⚠️ skipped", "error": "❌ error"}
     last_status = status_icons.get(snap["last_file_status"], "")
     if snap["current_zip"] or snap["current_csv"]:
         idx = min(done + 1, total_files) if total_files else done + 1
         counter = (f"Processing file **{idx} of {total_files}**"
                    if total_files else f"Processing file **{idx}**")
-        last_line = (f"  \\nLast file: {last_status}" if last_status else "")
-        cur.markdown(
-            f"{counter}  \\n"
-            f"📦 ZIP: `{snap['current_zip'] or '—'}`  \\n"
-            f"📄 CSV: `{snap['current_csv'] or '—'}`  \\n"
-            f"Rows scanned in this file: **{snap['current_rows']:,}**"
-            + last_line
-        )
+        lines = [counter,
+                 f"📦 Current ZIP: `{snap['current_zip'] or '—'}`",
+                 f"📄 Current CSV: `{snap['current_csv'] or '—'}`",
+                 f"Rows scanned in current file: **{snap['current_rows']:,}**"]
+        if last_status:
+            lines.append(f"Last file status: {last_status}")
+        cur.markdown("\n".join(lines))
     else:
         cur.markdown("Opening ZIP archive(s)…")
 
@@ -193,13 +201,16 @@ def _render_progress(tracker):
     )
 
     # ---- Final-stage visibility: live log lines during combining/export ----
-    stage_logs = snap["stage_logs"]
-    if stage_logs:
-        tail = stage_logs[-6:]  # keep the box compact; full history in Logs tab
-        lines = "\n\n".join(f"`[{t:6.1f}s]` {m}" for t, m in tail)
-        stage_box.markdown("**🛠 Final stage (live):**\n" + lines)
-    else:
-        stage_box.markdown("")
+    if show_final_stage:
+        stage_logs = snap["stage_logs"]
+        if stage_logs:
+            tail = stage_logs[-6:]  # keep the box compact; full history in Logs tab
+            # Deduplicated already by ProgressTracker.stage(); rendered with
+            # real line breaks inside a fenced code block (no visible escapes).
+            lines = "\n".join(f"[{t:6.1f}s] {m}" for t, m in tail)
+            stage_box.markdown("**🛠 Final stage (live):**\n```\n" + lines + "\n```")
+        else:
+            stage_box.markdown("")
     return snap
 
 
