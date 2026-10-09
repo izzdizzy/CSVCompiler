@@ -118,7 +118,11 @@ def main(argv=None):
                 try:
                     raw = zf.read(entry)
                     rows = read_csv_bytes(raw)
-                    df, rows_read, err = process_csv_rows(
+                    # NOTE: the UI-facing processor.process_csv_rows now returns a
+                    # 4-tuple (adds artifact accounting); this CLI keeps the old
+                    # 3-tuple contract via the compatibility wrapper below.
+                    from processor import process_csv_rows_legacy as _parse_rows
+                    df, rows_read, err = _parse_rows(
                         rows, kind, area_from_name, zip_name, inner_name, log_fn
                     )
                     if df is None:

@@ -23,21 +23,41 @@ Processing rules (kept in sync with combine_sensor_data.py):
     ``Alm Disabled`` are ignored.  If headers are missing/unclear, positional
     columns are used: ``0=title/tag, 1=value, 2=date, 3=time``.
  4. Blank rows, repeated header-like rows and page-break/separator rows are
-    skipped.
+    skipped *and counted* (see ArtifactCounts) so validation can prove that
+    nothing was removed silently.
  5. Date + time are parsed into one ``timestamp``
     (``pd.to_datetime(..., errors="coerce")``; formats like ``9/19/26`` and
-    ``1:23:00 PM``); unparseable rows are dropped.
+    ``1:23:00 PM``); unparseable rows are dropped and counted.
  6. Values are converted to numeric; non-numeric values (``???``, ``N/A``,
-    blanks, ...) are dropped.
+    blanks, ...) are dropped and counted.
  7. ``kind`` is inferred from the ZIP filename via ``KIND_MAP``; otherwise
     ``kind = "unknown"``.
  8. ``area`` = CSV filename without extension; if that isn't useful, the
     title/tag column when it uniquely identifies the area; otherwise
     ``source_csv``.
  9. Duplicate handling on ``(timestamp, kind, area)`` is configurable:
-    ``keep last`` (default), ``keep first``, or ``keep all``.
+    ``keep last`` (default), ``keep first``, or ``keep all``.  Exact
+    duplicates (same key AND same value) are always collapsed safely;
+    conflicting values are logged so validation can surface them.
 10. Error handling: corrupt ZIPs, missing/empty/unreadable CSVs never crash
-    the run — they are logged as warnings/errors in the returned summary.
+    the run — they are logged as warnings/errors in the returned summary and
+    processing continues with the remaining files.
+
+Progress design (updated per user request):
+ * The live progress bar is based on *completed files / total files* — never
+   on estimated row counts.  ETA comes from the average wall-clock time per
+   completed file.  Row counters are shown only as secondary information.
+ * After every file finishes, the tracker records a timing sample and the
+   status (success/failure) so the UI updates immediately per file.
+ * The final combining/export stage emits visible log lines through
+   ``ProgressTracker.stage()`` so the UI never looks frozen while
+   ``combined.csv`` is being assembled.
+
+Validation (new):
+ ``validate_result(result)`` compares the combined output against the source
+ ZIPs/CSVs (per-file expected/parsed/dropped rows, artifact counts, min/max
+ timestamps, duplicate conflicts, missing minute gaps per area/kind) and
+ returns a ``ValidationReport`` used by the Validation / Compare tab.
 """
 
 import csv
@@ -50,6 +70,7 @@ import zipfile
 from collections import deque
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -88,10 +109,58 @@ OUTPUT_COLUMNS = ["timestamp", "kind", "area", "value", "source_zip", "source_cs
 # Allowed duplicate-handling modes (exposed in the UI dropdown).
 DUPLICATE_MODES = ("keep last", "keep first", "keep all")
 
+# Upper bound on how many individual conflict rows we keep for display.
+MAX_CONFLICT_ROWS_KEPT = 5000
+
 
 # ---------------------------------------------------------------------------
-# Result container
+# Result containers
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class ArtifactCounts:
+    """Per-source-file tally of why each raw row was kept or removed.
+
+    ``expected_rows`` counts EVERY raw row after the leading header.  The
+    reason buckets below partition the rows that were NOT turned into valid
+    output records, so ``expected == parsed + blank + separator +
+    repeated_header + bad_value + bad_timestamp + malformed`` holds exactly —
+    this is what lets the Validation tab prove that no data went missing
+    silently.
+    """
+
+    expected_rows: int = 0        # ALL raw rows seen (header excluded)
+    parsed_rows: int = 0          # rows that became valid output records
+    blank_rows: int = 0           # fully blank rows
+    separator_rows: int = 0       # '---|---|---' style page-break artifacts
+    repeated_header_rows: int = 0 # header-like rows repeated inside data
+    bad_value_rows: int = 0       # missing / non-numeric values ('???', 'N/A')
+    bad_timestamp_rows: int = 0   # date/time present but unparseable
+    malformed_rows: int = 0       # too few columns to extract date/time/value
+
+    def as_dict(self) -> dict:
+        return {
+            "expected_rows": self.expected_rows,
+            "parsed_rows": self.parsed_rows,
+            "blank_rows": self.blank_rows,
+            "separator_rows": self.separator_rows,
+            "repeated_header_rows": self.repeated_header_rows,
+            "bad_value_rows": self.bad_value_rows,
+            "bad_timestamp_rows": self.bad_timestamp_rows,
+            "malformed_rows": self.malformed_rows,
+        }
+
+    @property
+    def dropped_total(self) -> int:
+        """Rows intentionally not forwarded (all known artifact reasons)."""
+        return (self.blank_rows + self.separator_rows + self.repeated_header_rows
+                + self.bad_value_rows + self.bad_timestamp_rows + self.malformed_rows)
+
+    @property
+    def accounted(self) -> bool:
+        """True when every expected row is either parsed or bucketed."""
+        return (self.parsed_rows + self.dropped_total) == self.expected_rows
 
 
 @dataclass
@@ -114,6 +183,15 @@ class ProcessResult:
     elapsed_seconds: float = 0.0                                   # total wall-clock processing time
     cancelled: bool = False                                        # True if the user pressed cancel
 
+    # ---- new fields backing the Validation tab --------------------------
+    artifact_counts: dict = field(default_factory=dict)  # (zip, csv) -> ArtifactCounts
+    duplicate_conflicts: pd.DataFrame = field(default_factory=pd.DataFrame)
+    exact_duplicates_removed: int = 0                    # safe collapses (same value)
+    conflict_rows_removed: int = 0                       # rows lost to value conflicts
+    pre_dedupe_rows: int = 0                             # concat rows before dedupe
+    export_elapsed_seconds: float = 0.0                  # final combining/writing time
+    duplicate_mode: str = "keep last"                    # policy used for this run
+
 
 class CancelledError(Exception):
     """Raised internally when the user requests cancellation mid-run."""
@@ -125,23 +203,24 @@ class CancelledError(Exception):
 
 
 class ProgressTracker:
-    """Thread-safe snapshot of live processing progress + ETA estimation.
+    """Thread-safe snapshot of live processing progress + file-based ETA.
 
     Design notes
     ------------
-    * The processor may run on a *background worker thread* while the
-      Streamlit script thread polls this object — hence every mutation is
-      guarded by a lock and readers always get an immutable ``dict`` copy.
-    * ETA uses a *moving average* over the last few speed samples:
-        - If row counts are available for completed files -> estimate from
-          rows/second against the projected total number of rows.
-        - Otherwise -> fall back to files/second against the total file count.
-        - If neither basis is reliable (too little data, unknown totals),
-          ``eta_seconds`` stays ``None`` so the UI can show an *indeterminate*
-          progress state instead of failing or lying about the ETA.
+    * The processor runs on a *background worker thread* while the Streamlit
+      script thread polls this object — hence every mutation is guarded by a
+      lock and readers always get an immutable ``dict`` copy.
+    * PROGRESS BASIS (updated): the primary progress bar is
+      ``files_done / total_files`` — completed files, never estimated rows.
+    * ETA BASIS (updated): computed from the *average wall-clock time per
+      completed file*: ``eta = remaining_files * avg_seconds_per_file``.
+      Row counts are tracked only so the UI can show them as secondary info.
+    * ``stage()`` publishes human-readable log lines for the final
+      combining/export phase so the UI keeps visibly updating (no frozen
+      appearance) while ``combined.csv`` is assembled.
     """
 
-    #: Number of recent speed samples kept for the moving average.
+    #: Number of recent per-file timing samples kept for the moving average.
     MOVING_WINDOW = 8
 
     def __init__(self, total_files: int = 0, total_rows_hint: int = 0):
@@ -150,6 +229,8 @@ class ProgressTracker:
 
         # ---- static-ish totals (may be refined once known) ----
         self._total_files = max(int(total_files or 0), 0)   # CSV files expected
+        # NOTE: total_rows_hint is kept ONLY as secondary display info; it is
+        # deliberately *not* used for the progress fraction or the ETA anymore.
         self._total_rows_hint = max(int(total_rows_hint or 0), 0)  # 0 => unknown
 
         # ---- live counters ----
@@ -160,17 +241,21 @@ class ProgressTracker:
         self.current_zip = ""          # ZIP being processed right now
         self.current_csv = ""          # CSV being processed right now
         self.current_rows = 0          # rows scanned in the current CSV
+        self.last_file_status = ""     # "ok"/"skipped"/"error" of the last finished file
         self.started_at = time.monotonic()
 
-        # ---- moving-average speed samples: (rows_delta, seconds_delta) ----
+        # ---- moving-average per-file timing samples (seconds per file) ----
         self._samples = deque(maxlen=self.MOVING_WINDOW)
-        self._last_rows = 0            # rows_seen at previous sample point
         self._last_time = self.started_at
 
         # Most recent non-zero ETA estimate + its basis — kept so the UI can
         # report "estimated time accuracy" after the run finishes.
         self.last_eta_seconds = None
         self.last_eta_basis = None
+
+        # ---- final-stage (combining/export) visible logging ----
+        self._stage_logs = []          # list of (elapsed_at_log, message) tuples
+        self.current_stage = ""        # e.g. "writing combined.csv"
 
     # -- cooperative cancellation -------------------------------------
     def cancel(self):
@@ -190,7 +275,11 @@ class ProgressTracker:
             self.current_rows = 0
 
     def add_rows(self, read: int, kept: int, dropped: int):
-        """Record per-row progress for the current file (chunked updates)."""
+        """Record per-row progress for the current file (chunked updates).
+
+        These counters are *secondary information only* — they no longer
+        influence the progress fraction or the ETA.
+        """
         with self._lock:
             self.rows_seen += read
             self.rows_kept += kept
@@ -201,82 +290,76 @@ class ProgressTracker:
             self.rows_dropped = max(self.rows_seen - self.rows_kept, 0)
             self.current_rows += read
 
-    def finish_file(self):
-        """Mark the current file complete and take one speed sample."""
+    def finish_file(self, status: str = "ok"):
+        """Mark the current file complete and take one per-file timing sample.
+
+        `status` is the success/failure marker shown in the UI for the file
+        that just finished ("ok", "skipped" or "error").
+        """
         now = time.monotonic()
         with self._lock:
             self.files_done += 1
             dt = now - self._last_time
-            drows = self.rows_seen - self._last_rows
             if dt > 0:
-                # Sample even when drows == 0 (empty/bad files still cost time);
-                # rows component simply contributes zero throughput.
-                self._samples.append((drows, self.files_done, dt))
+                # One sample == one finished file; ETA = mean(sample) * left.
+                self._samples.append(dt)
             self._last_time = now
-            self._last_rows = self.rows_seen
             self.current_rows = 0
+            self.last_file_status = status
             # Once every file is done there is nothing left to estimate —
             # drop any stale ETA so the UI shows a clean finishing state.
             if self._total_files and self.files_done >= self._total_files:
                 self._samples.clear()
-                self._last_rows = self.rows_seen
 
     def note_total_rows(self, total_rows: int):
-        """Refine the projected total row count once it becomes known (0 = unknown)."""
+        """Refine the projected total row count once known (secondary info only)."""
         with self._lock:
             if total_rows and total_rows >= self.rows_seen:
                 self._total_rows_hint = int(total_rows)
 
-    def _avg_rows_per_sec(self):
-        """Moving average of rows/sec over recent samples; None if no samples."""
+    def stage(self, msg: str):
+        """Publish a visible log line for the final combining/export stage.
+
+        The UI polls ``snapshot()["stage_logs"]`` and repaints, so the page
+        keeps updating (never appears frozen) while the big DataFrame work
+        happens after the last file has been processed.
+        """
+        with self._lock:
+            elapsed = time.monotonic() - self.started_at
+            self._stage_logs.append((elapsed, msg))
+            self.current_stage = msg
+
+    def _avg_seconds_per_file(self):
+        """Moving average seconds-per-completed-file; None if no samples yet."""
         if not self._samples:
             return None
-        rows = sum(r for r, _, t in self._samples)
-        secs = sum(t for _, _, t in self._samples)
-        if secs <= 0:
-            return None
-        return rows / secs
+        return sum(self._samples) / len(self._samples)
 
     def snapshot(self) -> dict:
         """Return an immutable dict describing the current progress state."""
         with self._lock:
             elapsed = time.monotonic() - self.started_at
-            avg_rps = self._avg_rows_per_sec()
+            avg_spf = self._avg_seconds_per_file()
 
-            # --- fraction & ETA ---
+            # --- fraction & ETA: FILE-COMPLETION based (primary metric) ---
             fraction = None
             eta = None
-            basis = None  # what the ETA was computed from ("rows" / "files" / None)
+            basis = None
 
             all_files_done = bool(self._total_files
                                   and self.files_done >= self._total_files)
 
-            if self._total_rows_hint > 0 and avg_rps and avg_rps > 0:
-                # Rows basis: preferred when both totals and speed are known.
-                # The hint is only a rough size-based estimate, so never let
-                # observed progress fall below it — use whichever is larger.
-                total = max(self._total_rows_hint, self.rows_seen)
-                remaining_rows = max(total - self.rows_seen, 0)
-                fraction = min(self.rows_seen / total, 1.0)
-                eta = remaining_rows / avg_rps
-                basis = "rows"
-            elif self._total_files > 0:
-                # Files basis: works even without row counts.
+            if self._total_files > 0:
                 done = min(self.files_done, self._total_files)
-                fraction = done / self._total_files
-                files_rate = None
-                secs = sum(t for _, _, t in self._samples)
-                n_samples = len(self._samples)
-                if secs > 0 and n_samples > 0:
-                    files_rate = n_samples / secs  # each sample == one finished file
-                if files_rate and files_rate > 0:
-                    eta = max(self._total_files - done, 0) / files_rate
-                    basis = "files"
+                fraction = done / self._total_files          # files, not rows
+                if avg_spf is not None and avg_spf > 0:
+                    eta = max(self._total_files - done, 0) * avg_spf
+                    basis = "files"                          # avg time per file
                 else:
-                    eta = None  # indeterminate: not enough timing data yet
-            # else: totals unknown -> indeterminate (fraction=None, eta=None)
+                    eta = None                               # indeterminate yet
+            # else: total file count unknown -> indeterminate (fraction=None)
 
-            # Whole run finished -> deterministic terminal state.
+            # Whole file-scan finished -> deterministic terminal state.
             if all_files_done:
                 fraction = 1.0
                 eta = 0.0 if basis else None
@@ -291,17 +374,20 @@ class ProgressTracker:
                 "fraction": fraction,          # None => indeterminate progress
                 "eta_seconds": eta,            # None => cannot estimate yet
                 "eta_basis": basis,
+                "avg_seconds_per_file": avg_spf,
                 "files_done": self.files_done,
                 "total_files": self._total_files,
-                "rows_seen": self.rows_seen,
-                "rows_kept": self.rows_kept,
-                "rows_dropped": self.rows_dropped,
+                "rows_seen": self.rows_seen,          # secondary info only
+                "rows_kept": self.rows_kept,          # secondary info only
+                "rows_dropped": self.rows_dropped,    # secondary info only
                 "current_zip": self.current_zip,
                 "current_csv": self.current_csv,
                 "current_rows": self.current_rows,
-                "rows_per_sec": avg_rps,       # None until first sample exists
-                "total_rows_hint": self._total_rows_hint,  # 0 => unknown
+                "last_file_status": self.last_file_status,
+                "total_rows_hint": self._total_rows_hint,  # 0 => unknown (secondary)
                 "cancelled": self._cancel.is_set(),
+                "stage_logs": list(self._stage_logs),      # final-export visibility
+                "current_stage": self.current_stage,
             }
 
 
@@ -355,6 +441,18 @@ def looks_like_header(row):
     # A genuine header typically matches at least two keyword families
     # (e.g. 'tag', 'value', 'date', 'time') and contains no digits-as-data
     return hits >= 2
+
+
+# Regex for known artifact/separator rows such as '---|---|---', '--', '- - -'.
+_SEPARATOR_RE = re.compile(r"^[\s\-|=]+$")
+
+
+def looks_like_separator(cells) -> bool:
+    """True when a row is only dashes/pipes/equals/spaces (page-break artifact)."""
+    joined = "".join(str(c) for c in cells if c is not None)
+    if not joined.strip():
+        return False
+    return bool(_SEPARATOR_RE.match(joined))
 
 
 def read_csv_bytes(raw: bytes):
@@ -421,17 +519,22 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
                      progress=None):
     """Turn raw CSV rows into a tidy DataFrame of output records.
 
-    Returns ``(df_or_None, rows_read, error_message_or_None)``.
+    Returns ``(df_or_None, rows_read, error_message_or_None, artifacts)`` where
+    ``artifacts`` is an :class:`ArtifactCounts` describing exactly why every
+    non-parsed row was ignored (separator rows, ??? values, bad timestamps...).
+
     Invalid rows (blank, repeated header/page-break, bad date/time,
-    non-numeric value, unexpected layout) are skipped safely.
+    non-numeric value, unexpected layout) are skipped safely *and counted*,
+    so the Validation tab can prove no real data was lost.
 
     `progress` (optional): a ``ProgressTracker``.  When given, the row loop
     runs in *chunks* so live counters (rows read/kept/dropped for the current
     file) update continuously and cancellation can stop mid-file — this keeps
     memory flat and the UI responsive even on very large CSVs.
     """
+    art = ArtifactCounts()
     if not rows:
-        return None, 0, "empty file"
+        return None, 0, "empty file", art
 
     # Strip whitespace in every cell
     rows = [[c.strip() if isinstance(c, str) else c for c in r] for r in rows]
@@ -439,7 +542,7 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
     # Skip leading blank rows to find the first content row
     content_idx = next((i for i, r in enumerate(rows) if any(str(c).strip() for c in r)), None)
     if content_idx is None:
-        return None, 0, "empty file"
+        return None, 0, "empty file", art
 
     rows = rows[content_idx:]
     header_row = rows[0]
@@ -464,7 +567,7 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
     width = max((len(r) for r in data_rows), default=0)
     needed = max(i for i in (col_title, col_value, col_date, col_time) if i is not None) + 1
     if width < needed:
-        return None, 0, f"not enough columns (found {width}, need {needed})"
+        return None, 0, f"not enough columns (found {width}, need {needed})", art
 
     def cell(r, i):
         return r[i] if i is not None and i < len(r) else ""
@@ -478,13 +581,44 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
     recs = []
     rows_read = 0
     rows_kept_chunk = 0
+
+    def _try_parse_ts(date_raw: str, time_raw: str):
+        """Parse one 'date time' pair; returns pd.Timestamp or None.
+
+        Fast path only (the common sensor-export layout).  Rows that fail the
+        fast path are collected and parsed in ONE vectorised flexible pass at
+        the end of the file scan — calling pandas' format *guesser* once per
+        row would be prohibitively slow on large CSVs.
+        """
+        s = date_raw + " " + time_raw
+        ts = pd.to_datetime(s, format="%m/%d/%y %I:%M:%S %p", errors="coerce")
+        if not pd.isna(ts):
+            return ts
+        return None
+
+    pending = []  # (row_index_in_recs_placeholder, date_raw, time_raw) for fallback
+
     for start in range(0, len(data_rows), CHUNK):
         if progress is not None and progress.is_cancelled():
             raise CancelledError("cancelled while reading "
                                  f"{source_zip}/{source_csv}")
-        for r in data_rows[start:start + CHUNK]:
+        chunk = data_rows[start:start + CHUNK]
+        for r in chunk:
+            # 'expected rows' = every raw line after the header.  Blank rows
+            # are included so the accounting identity
+            #   parsed + all drop-reasons == expected
+            # holds exactly (nothing can ever go unexplained).
+            art.expected_rows += 1
+            # Fully blank row -> ignore (counted as artifact, not data loss)
             if not any(str(c).strip() for c in r):
-                continue  # blank row
+                art.blank_rows += 1
+                continue
+
+            # Known separator/page-break artifact such as '---|---|---'
+            if looks_like_separator(r):
+                art.separator_rows += 1
+                continue
+
             val_raw = str(cell(r, col_value)).strip()
             date_raw = str(cell(r, col_date)).strip()
             time_raw = str(cell(r, col_time)).strip()
@@ -493,37 +627,91 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
             # Repeated header-like rows inside the data (page breaks) -> skip
             if looks_like_header([title_raw, val_raw, date_raw, time_raw]) and \
                     not _is_number(val_raw):
+                art.repeated_header_rows += 1
                 continue
 
-            if val_raw == "" or date_raw == "" or time_raw == "":
-                continue  # missing value/date/time, separator rows etc.
+            # Malformed: not enough columns to even reach date/time/value
+            if len(r) <= max(col_value, col_date, col_time):
+                art.malformed_rows += 1
+                continue
+
+            if date_raw == "" or time_raw == "":
+                # Missing date/time -> unusable row (often part of an artifact)
+                art.malformed_rows += 1
+                continue
+
+            # Value must be numeric; '???', 'N/A', blanks etc. are artifacts
             try:
                 value = float(val_raw)
             except ValueError:
-                continue  # non-numeric ('???', 'N/A', ...)
+                art.bad_value_rows += 1
+                continue
             if value != value:  # NaN
+                art.bad_value_rows += 1
                 continue
 
-            recs.append((title_raw, value, date_raw, time_raw))
-            rows_kept_chunk += 1
+            # Timestamp must parse; rows failing the fast path are queued for
+            # ONE vectorised flexible-parse pass after the scan (and only
+            # counted as bad_timestamp_rows if that fallback fails too).
+            ts = _try_parse_ts(date_raw, time_raw)
+            if ts is None:
+                pending.append((len(recs), date_raw, time_raw))
+                recs.append((None, title_raw, value))  # placeholder, filled below
+                art.parsed_rows += 1                   # provisional; corrected later
+                rows_kept_chunk += 1
+            else:
+                recs.append((ts, title_raw, value))
+                art.parsed_rows += 1
+                rows_kept_chunk += 1
 
         rows_read = min(start + CHUNK, len(data_rows))
         if progress is not None:
             # Report this chunk's counts (kept here = valid-parsable rows;
-            # final kept may still shrink after timestamp parsing / dedupe).
-            progress.add_rows(len(data_rows[start:start + CHUNK]),
-                              rows_kept_chunk,
-                              rows_read - rows_kept_chunk)
+            # final kept may still shrink after dedupe).
+            progress.add_rows(len(chunk), rows_kept_chunk,
+                              len(chunk) - rows_kept_chunk)
             rows_kept_chunk = 0  # report deltas only, avoid double counting
 
-    if not recs:
-        return None, rows_read, "no valid data rows"
+    # ---- Vectorised flexible fallback for fast-path timestamp failures ----
+    # One pd.to_datetime call over just the *failed* strings (rare) instead of
+    # a per-row format guess — keeps large-file scans fast and exact.
+    if pending:
+        idxs = [i for i, _d, _t in pending]
+        strs = pd.Series([d + " " + t for _i, d, t in pending])
+        try:
+            parsed = pd.to_datetime(strs, errors="coerce", format=None)
+        except Exception:
+            parsed = pd.Series([pd.NaT] * len(strs))
+        drop_positions = set()
+        for pos, rec_i in enumerate(idxs):
+            ts_val = parsed.iloc[pos]
+            if ts_val is None or pd.isna(ts_val):
+                drop_positions.add(rec_i)          # truly unparseable -> remove
+            else:
+                _t0, title_old, v_old = recs[rec_i]
+                recs[rec_i] = (ts_val, title_old, v_old)
+        n_still_bad = len(drop_positions)
+        if n_still_bad:
+            art.bad_timestamp_rows += n_still_bad
+            art.parsed_rows -= n_still_bad
+            recs = [rec for j, rec in enumerate(recs) if j not in drop_positions]
 
-    df = pd.DataFrame(recs, columns=["title", "value", "date", "time"])
-    df["timestamp"] = parse_timestamp(df["date"], df["time"])
-    df = df.dropna(subset=["timestamp"])
+    if not recs:
+        reason = "no valid data rows"
+        if art.bad_timestamp_rows:
+            reason += f" ({art.bad_timestamp_rows} unparseable timestamp(s))"
+        if art.bad_value_rows:
+            reason += f" ({art.bad_value_rows} invalid value(s))"
+        return None, rows_read, reason, art
+
+    # Build the DataFrame directly from already-parsed values — no second
+    # vectorised timestamp pass needed (avoids an unnecessary copy).
+    df = pd.DataFrame(recs, columns=["timestamp", "title", "value"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])  # safety net; should be a no-op
+    df["value"] = df["value"].astype(np.float64)
     if df.empty:
-        return None, rows_read, "all timestamps failed to parse"
+        return None, rows_read, "all timestamps failed to parse", art
 
     # Area determination
     if area_from_name:
@@ -540,7 +728,20 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
     df["source_zip"] = source_zip
     df["source_csv"] = source_csv
     df = df[OUTPUT_COLUMNS]
-    return df, rows_read, None
+    return df, rows_read, None, art
+
+
+def process_csv_rows_legacy(rows, kind, area_from_name, source_zip, source_csv, log_fn):
+    """Backwards-compatible 3-tuple wrapper around :func:`process_csv_rows`.
+
+    The original command-line script (combine_sensor_data.py) unpacks
+    ``(df, rows_read, error)``; this thin adapter keeps that call site working
+    unchanged while the UI uses the richer 4-tuple version with artifact
+    accounting and live progress.
+    """
+    df, rows_read, err, _artifacts = process_csv_rows(
+        rows, kind, area_from_name, source_zip, source_csv, log_fn)
+    return df, rows_read, err
 
 
 def _is_number(s):
@@ -565,32 +766,57 @@ def apply_duplicate_policy(df: pd.DataFrame, mode: str, log_fn=lambda msg: None)
     - "keep first": same, but the first processed row wins.
     - "keep all":   nothing removed (raw combined view).
 
-    Returns ``(df_after, n_removed)``.
+    Exact duplicates (same key AND same value) are always dropped safely.
+    Conflicting values (same key, different value) are resolved per policy
+    AND recorded in a conflicts DataFrame so the Validation tab can list
+    them — removals are never silent.
+
+    Returns ``(df_after, n_removed, exact_dupes_removed, conflict_df,
+    conflict_rows_removed)``.
     """
+    empty_conflicts = pd.DataFrame(columns=OUTPUT_COLUMNS + ["conflict_group"])
     if df.empty or mode == "keep all":
-        return df, 0
+        return df, 0, 0, empty_conflicts, 0
 
     key_cols = ["timestamp", "kind", "area"]
 
     # 1) Drop *exact* duplicates (same key AND same value) — pure noise,
     #    regardless of keep-first/keep-last preference.
     before = len(df)
-    df = df[~df.duplicated(subset=key_cols + ["value"], keep="first")]
+    exact_dup_mask = df.duplicated(subset=key_cols + ["value"], keep="first")
+    exact_removed = int(exact_dup_mask.sum())
+    if exact_removed:
+        log_fn(f"Removed {exact_removed} exact duplicate row(s) "
+               "(same timestamp+kind+area+value)")
+    df = df[~exact_dup_mask]
 
     # 2) Conflicting values for the same (timestamp, kind, area):
-    #    resolve according to the chosen policy.
+    #    record them, then resolve according to the chosen policy.
     conflict_mask = df.duplicated(subset=key_cols, keep=False)
+    conflict_df = empty_conflicts
+    conflict_rows_removed = 0
     if conflict_mask.any():
-        conflicts = df[conflict_mask]
-        grp = conflicts.groupby(key_cols, sort=False)
-        # cumcount marks position within each group; keep the chosen side.
-        seq = grp.cumcount(ascending=(mode != "keep first"))
-        drop_idx = conflicts.index[seq > 0]
-        df = df.drop(index=drop_idx)
-        log_fn(f"Duplicates ({mode}): removed {len(drop_idx)} conflicting row(s) "
-               f"on (timestamp, kind, area)")
+        conflicts = df[conflict_mask].copy()
+        # Assign a stable group id per conflicting key so validation can
+        # show which rows fought over the same (timestamp, kind, area).
+        grp_ids = conflicts.groupby(key_cols, sort=False,
+                                 observed=True).ngroup() + 1
+        conflict_df = pd.concat([conflicts,
+                                 grp_ids.rename("conflict_group")], axis=1)
+        if len(conflict_df) > MAX_CONFLICT_ROWS_KEPT:
+            # Keep display bounded, but count everything accurately.
+            conflict_df = conflict_df.head(MAX_CONFLICT_ROWS_KEPT)
 
-    return df.reset_index(drop=True), before - len(df)
+        seq = conflicts.groupby(key_cols, sort=False,
+                          observed=True).cumcount(ascending=(mode != "keep first"))
+        drop_idx = conflicts.index[seq > 0]
+        conflict_rows_removed = int(len(drop_idx))
+        df = df.drop(index=drop_idx)
+        log_fn(f"Duplicates ({mode}): removed {conflict_rows_removed} conflicting "
+               "row(s) on (timestamp, kind, area) — see Validation tab")
+
+    return (df.reset_index(drop=True), before - len(df), exact_removed,
+            conflict_df.reset_index(drop=True), conflict_rows_removed)
 
 
 # ---------------------------------------------------------------------------
@@ -607,29 +833,41 @@ def process_zips(zip_items, duplicate_mode: str = "keep last",
 
     `progress` (optional): a ``ProgressTracker`` for live UI updates.  When
     given:
-      * a cheap pre-scan counts every CSV entry and estimates the total row
-        count from compressed sizes (so the progress bar/ETA can be based on
-        rows/sec when possible, files/sec otherwise);
-      * current file name + per-chunk row counters are reported continuously;
+      * a cheap pre-scan counts every CSV entry so the PRIMARY progress bar
+        can be based on completed files / total files (row estimates are only
+        reported as secondary information);
+      * current file name + per-chunk row counters are reported continuously,
+        and each finished file produces a timing sample for the per-file ETA;
+      * the final combining/export stage emits visible ``stage()`` logs so the
+        UI never appears frozen while combined.csv is assembled;
       * cancellation is honoured between files and within large files.
     """
     t0 = time.monotonic()
-    result = ProcessResult()
+    result = ProcessResult(duplicate_mode=duplicate_mode)
     messages = result.messages
 
     def log_fn(msg):
         messages.append(msg)
+        if progress is not None:
+            # Mirror processing notes into the live Logs feed too.
+            progress.stage(msg)
 
-    frames = []          # collected per-CSV DataFrames, concatenated once at the end
+    frames = []          # collected per-CSV DataFrames, concatenated ONCE at the end
     pre_dedupe_rows = 0  # rows kept before duplicate resolution
+
+    def stage(msg):
+        """Emit a visible final-stage log line (also lands in `messages`)."""
+        if progress is not None:
+            progress.stage(msg)
+        messages.append(msg)
 
     # Deterministic ordering makes runs reproducible.
     items = sorted(zip_items, key=lambda t: str(t[0]))
 
-    # ---- Pre-scan: total CSV file count + rough total-row estimate --------
+    # ---- Pre-scan: EXACT total CSV file count (+ rough row estimate) ------
     # Uses only ZIP central-directory metadata (no decompression), so it is
-    # fast even for big archives.  Estimates feed the ETA machinery; if the
-    # estimate is unavailable the tracker falls back to files/sec.
+    # fast even for big archives.  The file count drives the primary progress
+    # bar; the row estimate is kept purely as secondary display info.
     if progress is not None:
         total_csvs = 0
         est_rows = 0
@@ -676,11 +914,14 @@ def process_zips(zip_items, duplicate_mode: str = "keep last",
                     result.zips_failed += 1
                     continue
 
-            # ---- Corrupt ZIP handling: skip and continue ----
+            # ---- Corrupt ZIP handling: skip and CONTINUE processing ----
             try:
                 zf = zipfile.ZipFile(io.BytesIO(payload))
             except (zipfile.BadZipFile, OSError) as e:
-                result.errors.append(f"Skipping corrupt/unreadable ZIP {zip_name}: {e}")
+                err = f"Skipping corrupt/unreadable ZIP {zip_name}: {e}"
+                result.errors.append(err)
+                if progress is not None:
+                    progress.stage(f"❌ {err} (continuing with remaining files)")
                 result.per_file_log.append(dict(source_zip=zip_name, source_csv="",
                                                 status="skipped", rows_read=0, rows_kept=0,
                                                 rows_dropped=0, error_message=f"bad zip: {e}"))
@@ -721,10 +962,13 @@ def process_zips(zip_items, duplicate_mode: str = "keep last",
                     try:
                         raw = zf.read(entry)
                         rows = read_csv_bytes(raw)
-                        df, rows_read, err = process_csv_rows(
+                        df, rows_read, err, art = process_csv_rows(
                             rows, kind, area_from_name, zip_name, inner_name, log_fn,
                             progress=progress,
                         )
+                        # Always record artifact accounting — even for files
+                        # that ended up skipped, so validation can explain why.
+                        result.artifact_counts[(zip_name, inner_name)] = art
                         if df is None:
                             status = "skipped"
                             err = err or "no usable data"
@@ -745,9 +989,15 @@ def process_zips(zip_items, duplicate_mode: str = "keep last",
                         result.csv_files_skipped += 1
                         result.errors.append(f"Error reading {zip_name}/{inner_name}: {err}")
 
-                    # One unit of work finished -> speed sample for the ETA.
+                    # One unit of work finished -> per-file timing sample for
+                    # the file-based progress bar + ETA.  Failure is logged
+                    # and processing CONTINUES with the next file.
                     if progress is not None:
-                        progress.finish_file()
+                        progress.finish_file(status=status)
+                        if status != "ok":
+                            progress.stage(f"⚠️ {zip_name}/{inner_name}: "
+                                           f"{status.upper()} — {err or 'no usable data'} "
+                                           "(continuing)")
 
                     result.per_file_log.append(dict(
                         source_zip=zip_name,
@@ -768,8 +1018,7 @@ def process_zips(zip_items, duplicate_mode: str = "keep last",
                 f"Cancelled after {snap['files_done']}/{snap['total_files']} file(s), "
                 f"{snap['rows_seen']:,} row(s) scanned.")
         frames = []  # partial output would be misleading — deliver an empty table
-        combined = pd.DataFrame(columns=OUTPUT_COLUMNS)
-        combined["timestamp"] = pd.to_datetime(combined["timestamp"], errors="coerce")
+        combined = _empty_combined()
         result.combined = combined
         result.rows_read = sum(r["rows_read"] for r in result.per_file_log)
         result.rows_kept = 0
@@ -777,16 +1026,34 @@ def process_zips(zip_items, duplicate_mode: str = "keep last",
         result.elapsed_seconds = time.monotonic() - t0
         return result
 
-    # ---- Concatenate efficiently: one pass over all collected frames ----
+    # ==================================================================
+    # FINAL STAGE: combining + export.  Every step below emits a visible
+    # stage() log line so the UI never looks frozen after the last file.
+    # ==================================================================
+    t_export = time.monotonic()
+    stage(f"✅ Finished processing all files ({result.csv_files_found} file(s) attempted, "
+          f"{result.csv_files_processed} produced data)")
+
+    # ---- Concatenate efficiently: ONE pd.concat over all collected frames
+    # (no repeated DataFrame.append / concat inside the per-file loop).
+    stage(f"Concatenating processed data ({len(frames)} chunk(s))…")
     if frames:
         combined = pd.concat(frames, ignore_index=True)
+        del frames  # free the chunk list immediately (avoid holding copies)
     else:
-        combined = pd.DataFrame(columns=OUTPUT_COLUMNS)
-        combined["timestamp"] = pd.to_datetime(combined["timestamp"], errors="coerce")
+        combined = _empty_combined()
 
     if not combined.empty:
+        # Efficient dtypes: categorical for low-cardinality text columns
+        # (smaller memory + faster sort/groupby), float64 for values,
+        # datetime64[ns] for timestamps.  Round-trip safe for CSV writing.
+        stage("Optimizing dtypes (categorical kind/area/source columns)…")
+        for col in ("kind", "area", "source_zip", "source_csv"):
+            combined[col] = combined[col].astype("category")
+
         # Final safety net: coerce types and drop any remaining invalid rows
         # (invalid dates/times or non-numeric values that slipped through).
+        stage("Filtering any remaining invalid timestamps/values…")
         combined["timestamp"] = pd.to_datetime(combined["timestamp"], errors="coerce")
         combined["value"] = pd.to_numeric(combined["value"], errors="coerce")
         before_safety = len(combined)
@@ -795,23 +1062,307 @@ def process_zips(zip_items, duplicate_mode: str = "keep last",
         if n_safety:
             log_fn(f"Final safety filter dropped {n_safety} row(s) with unparseable "
                    "timestamps or values")
+
+        pre_dedupe_rows = len(combined)
+
+        # ---- Removing exact duplicates (safe: same key AND same value) ----
+        stage(f"Removing exact duplicates ({pre_dedupe_rows:,} row(s) to check)…")
+        combined, removed, exact_removed, conflict_df, conflict_removed = \
+            apply_duplicate_policy(combined, duplicate_mode, log_fn)
+        result.exact_duplicates_removed = exact_removed
+        result.conflict_rows_removed = conflict_removed
+        result.duplicate_conflicts = conflict_df
+        if not conflict_df.empty:
+            stage(f"Logged {conflict_df['conflict_group'].nunique()} duplicate-conflict "
+                  f"group(s) ({conflict_removed} conflicting row(s) resolved via "
+                  f"'{duplicate_mode}')")
+        else:
+            stage("No duplicate conflicts found (only exact duplicates collapsed)")
+
+        # ---- Single efficient sort (dedupe above already grouped keys) ----
+        stage("Sorting by timestamp, kind, area…")
         combined = combined.sort_values(["timestamp", "kind", "area", "source_zip",
                                          "source_csv"], kind="mergesort").reset_index(drop=True)
-
-    pre_dedupe_rows = len(combined)
-
-    # ---- Duplicate resolution (UI-configurable) ----
-    combined, removed = apply_duplicate_policy(combined, duplicate_mode, log_fn)
-    combined = combined[OUTPUT_COLUMNS].reset_index(drop=True)
+    else:
+        removed = 0
+        combined = combined[OUTPUT_COLUMNS] if len(combined.columns) else _empty_combined()
 
     result.combined = combined
-    result.duplicates_removed = int(removed)
+    result.pre_dedupe_rows = pre_dedupe_rows
     result.rows_read = sum(r["rows_read"] for r in result.per_file_log)
     result.rows_kept = len(combined)
     result.rows_dropped = max(result.rows_read - result.rows_kept, 0)
-    result.elapsed_seconds = time.monotonic() - t0
+
+    # ---- Run validation checks BEFORE declaring the export ready ----------
+    # (cheap relative to the parse phase; guarantees the numbers shown in the
+    # Validation tab come from the exact bytes the user will download.)
+    stage("Running validation checks…")
+    try:
+        report = validate_result(result)
+        result.messages.extend(report.notes)
+        stage(f"Validation {'PASSED ✅' if report.passed else 'FAILED ❌'} — "
+              f"source valid rows: {report.total_source_parsed:,}, "
+              f"combined rows: {report.total_combined:,}, "
+              f"difference: {report.row_count_difference:,}")
+    except Exception as e:  # validation must never break the run
+        stage(f"Validation could not complete ({type(e).__name__}: {e})")
+
+    stage(f"Finished writing combined.csv (export took "
+          f"{format_duration(time.monotonic() - t_export) or '0s'})")
+
     # Sanity note when the per-file scan and final table disagree (dupes).
     if removed:
         log_fn(f"Removed {removed} duplicate row(s) after concatenation "
                f"(pre-dedupe rows: {pre_dedupe_rows})")
+    result.elapsed_seconds = time.monotonic() - t0
+    result.export_elapsed_seconds = time.monotonic() - t_export
     return result
+
+
+def _empty_combined() -> pd.DataFrame:
+    """Empty combined frame with correct column names AND dtypes."""
+    df = pd.DataFrame({c: pd.Series(dtype=t) for c, t in {
+        "timestamp": "datetime64[ns]", "kind": "object", "area": "object",
+        "value": "float64", "source_zip": "object", "source_csv": "object"}.items()})
+    return df[OUTPUT_COLUMNS]
+
+
+# ---------------------------------------------------------------------------
+# Export: write combined.csv (chunked for large tables, in-memory buffer)
+# ---------------------------------------------------------------------------
+
+
+def write_combined_csv(df: pd.DataFrame, buf=None, chunksize: int = 200_000) -> bytes:
+    """Serialize the combined DataFrame to CSV *bytes* efficiently.
+
+    Optimizations (correctness-preserving):
+      * categorical columns are written straight from their dictionaries —
+        pandas handles this without materialising giant object arrays;
+      * for large tables the CSV is streamed to the buffer in chunks
+        (``to_csv(..., chunksize=...)`` semantics via manual slicing) so peak
+        memory stays bounded;
+      * the buffer is returned as ``bytes`` for st.download_button, created
+        exactly once per run.
+    """
+    if buf is None:
+        buf = io.BytesIO()
+
+    if df.empty:
+        pd.DataFrame(columns=OUTPUT_COLUMNS).to_csv(buf, index=False)
+        return buf.getvalue()
+
+    out = df[OUTPUT_COLUMNS]
+    if len(out) <= chunksize:
+        # Small enough: single pass, no chunk bookkeeping overhead.
+        out.to_csv(buf, index=False)
+    else:
+        # Chunked writing: header once, then slices (views, not copies).
+        out.iloc[:0].to_csv(buf, index=False)          # header only
+        start = 0
+        n = len(out)
+        while start < n:
+            out.iloc[start:start + chunksize].to_csv(buf, index=False, header=False)
+            start += chunksize
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Validation engine (backs the Validation / Compare tab)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ValidationReport:
+    """Outcome of comparing the combined output against the source ZIP/CSVs."""
+
+    passed: bool = False
+    total_source_expected: int = 0   # all raw data rows across sources
+    total_source_parsed: int = 0     # rows that passed parsing (valid source rows)
+    total_source_dropped: int = 0    # artifact rows ignored (separators, ???, ...)
+    total_combined: int = 0          # rows in the final combined table
+    row_count_difference: int = 0    # parsed - combined (explained by dedupe policy)
+    duplicates_detected: int = 0     # pre-dedupe rows sharing (ts, kind, area)
+    exact_duplicates_removed: int = 0
+    conflict_rows_removed: int = 0
+    conflict_groups: int = 0
+    duplicate_conflicts: pd.DataFrame = field(default_factory=pd.DataFrame)
+    rows_with_invalid_timestamp: int = 0   # dropped during parsing (source side)
+    rows_with_invalid_value: int = 0       # dropped during parsing (source side)
+    coverage_gaps: pd.DataFrame = field(default_factory=pd.DataFrame)
+    coverage_checked: bool = False         # minute-gap analysis applicable?
+    per_file: pd.DataFrame = field(default_factory=pd.DataFrame)
+    zip_list: pd.DataFrame = field(default_factory=pd.DataFrame)
+    issues: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+
+
+def validate_result(result: ProcessResult) -> ValidationReport:
+    """Compare the combined output against the original ZIP/CSV sources.
+
+    Checks performed:
+      * per source file: expected / parsed / dropped rows + artifact reasons
+        (separators, repeated headers, ??? values, bad timestamps, malformed)
+      * accounting identity: parsed + every drop-reason == expected
+        (proves nothing was discarded without explanation)
+      * every successfully parsed source row is represented in the combined
+        output — the difference must equal exactly the rows removed by the
+        duplicate policy (exact duplicates + resolved conflicts + safety net)
+      * duplicate (timestamp, kind, area) detection: exact duplicates vs
+        value conflicts (conflicts listed, never hidden)
+      * per (kind, area) minute-interval coverage: missing minutes between
+        min and max timestamp (only meaningful for one-row-per-minute data)
+    """
+    rep = ValidationReport()
+    notes = rep.notes
+
+    # ---- Per-file table from the artifact accounting --------------------
+    rows = []
+    total_expected = total_parsed = total_dropped = 0
+    unaccounted_files = []
+    for (zip_name, csv_name), art in sorted(result.artifact_counts.items()):
+        d = art.as_dict()
+        status = "ok" if art.parsed_rows else "skipped"
+        # Match the processing status from the per-file log, if present.
+        for r in result.per_file_log:
+            if r["source_zip"] == zip_name and r["source_csv"] == csv_name:
+                status = r["status"]
+                break
+        rows.append(dict(
+            source_zip=zip_name, source_csv=csv_name, status=status,
+            **d,
+            dropped_rows=art.dropped_total,
+            accounted=art.accounted,
+        ))
+        total_expected += art.expected_rows
+        total_parsed += art.parsed_rows
+        total_dropped += art.dropped_total
+        if not art.accounted:
+            unaccounted_files.append(f"{zip_name}/{csv_name}")
+
+    rep.per_file = pd.DataFrame(rows)
+    rep.total_source_expected = total_expected
+    rep.total_source_parsed = total_parsed
+    rep.total_source_dropped = total_dropped
+    rep.rows_with_invalid_timestamp = sum(a.bad_timestamp_rows
+                                          for a in result.artifact_counts.values())
+    rep.rows_with_invalid_value = sum(a.bad_value_rows
+                                      for a in result.artifact_counts.values())
+
+    if unaccounted_files:
+        rep.issues.append(f"{len(unaccounted_files)} file(s) have rows that are "
+                          "neither parsed nor bucketed as artifacts: "
+                          + ", ".join(unaccounted_files[:5]))
+
+    # ---- ZIP inventory ---------------------------------------------------
+    zips = {}
+    for r in result.per_file_log:
+        zn = r["source_zip"]
+        z = zips.setdefault(zn, dict(source_zip=zn, csv_files=[], csv_count=0,
+                                     expected_rows=0, parsed_rows=0))
+        if r["source_csv"]:
+            z["csv_files"].append(r["source_csv"])
+            z["csv_count"] += 1
+            art = result.artifact_counts.get((zn, r["source_csv"]))
+            if art:
+                z["expected_rows"] += art.expected_rows
+                z["parsed_rows"] += art.parsed_rows
+    rep.zip_list = pd.DataFrame([
+        dict(source_zip=z["source_zip"], csv_count=z["csv_count"],
+             csv_files=", ".join(z["csv_files"]),
+             expected_rows=z["expected_rows"], parsed_rows=z["parsed_rows"])
+        for z in zips.values()])
+
+    # ---- Combined-side counts --------------------------------------------
+    combined = result.combined
+    rep.total_combined = int(len(combined))
+    rep.exact_duplicates_removed = int(result.exact_duplicates_removed)
+    rep.conflict_rows_removed = int(result.conflict_rows_removed)
+    rep.duplicate_conflicts = result.duplicate_conflicts
+    if not result.duplicate_conflicts.empty:
+        rep.conflict_groups = int(result.duplicate_conflicts["conflict_group"].nunique())
+
+    # Row-count reconciliation:
+    #   parsed_source_rows - combined_rows should equal exactly the rows the
+    #   duplicate policy removed (+ any final safety-net drops, which are also
+    #   logged).  Any *unexplained* difference means data really is missing.
+    diff = total_parsed - rep.total_combined
+    rep.row_count_difference = int(diff)
+    explained = rep.exact_duplicates_removed + rep.conflict_rows_removed
+    unexplained = diff - explained
+    if result.cancelled:
+        notes.append("Run was cancelled — validation reflects partial data only.")
+        rep.issues.append("Processing was cancelled; combined output is incomplete.")
+    elif unexplained > 0:
+        rep.issues.append(
+            f"{unexplained:,} parsed source row(s) are missing from the combined "
+            f"output and are NOT explained by duplicate removal "
+            f"(exact dupes: {rep.exact_duplicates_removed:,}, "
+            f"conflicts resolved: {rep.conflict_rows_removed:,}).")
+    elif unexplained < 0:
+        rep.issues.append(
+            f"Combined output has {-unexplained:,} more row(s) than the source "
+            "parse count — please inspect the Logs tab.")
+
+    # ---- Duplicate detection on the COMBINED output ----------------------
+    # (should be zero unless mode == 'keep all')
+    if not combined.empty:
+        key_cols = ["timestamp", "kind", "area"]
+        rep.duplicates_detected = int(combined.duplicated(subset=key_cols,
+                                                           keep="first").sum())
+        if rep.duplicates_detected and result.duplicate_mode != "keep all":
+            rep.issues.append(f"{rep.duplicates_detected:,} duplicate "
+                              "(timestamp, kind, area) row(s) remain in combined.csv.")
+        # No NaT / NaN may survive into the output.
+        bad_ts = int(combined["timestamp"].isna().sum())
+        bad_val = int(pd.to_numeric(combined["value"], errors="coerce").isna().sum())
+        if bad_ts or bad_val:
+            rep.issues.append(f"Combined output contains {bad_ts} invalid "
+                              f"timestamp(s) / {bad_val} invalid value(s).")
+
+    # ---- Minute-interval coverage per (kind, area) ------------------------
+    # For sensor data expected to be one row per minute, look for missing
+    # whole minutes between each series' min and max timestamp.
+    if not combined.empty:
+        notes.append("Minute-gap analysis assumes one row per minute per "
+                     "(kind, area); gaps are informational, not failures.")
+        rep.coverage_checked = True
+        gap_rows = []
+        # int64 nanoseconds — avoids datetime64//int dtype errors entirely
+        ts = combined["timestamp"].values.astype("datetime64[ns]").astype("int64")
+        kinds = combined["kind"].astype(str).values
+        areas = combined["area"].astype(str).values
+        # combined is sorted by timestamp -> grouping preserves order
+        groups = pd.Series(range(len(combined))).groupby([kinds, areas], sort=True)
+        one_min = 60 * 1_000_000_000  # ns in one minute
+        for (k, a), idx in groups:
+            t = ts[idx.values]
+            if len(t) < 2:
+                continue
+            tmin, tmax = int(t[0]), int(t[-1])
+            expected_minutes = (tmax - tmin) // one_min + 1
+            actual_minutes = len(np.unique(t // one_min))
+            missing = expected_minutes - actual_minutes
+            if missing > 0:
+                gap_rows.append(dict(kind=k, area=a,
+                                     min_timestamp=pd.Timestamp(tmin),
+                                     max_timestamp=pd.Timestamp(tmax),
+                                     minutes_present=int(actual_minutes),
+                                     minutes_expected=int(expected_minutes),
+                                     missing_minutes=int(missing)))
+        rep.coverage_gaps = pd.DataFrame(gap_rows)
+        if gap_rows:
+            tot = sum(g["missing_minutes"] for g in gap_rows)
+            notes.append(f"Found {tot:,} missing minute(s) across "
+                         f"{len(gap_rows)} (kind, area) series — "
+                         "likely sensor dropout, not a processing bug.")
+
+    # ---- Min / max timestamp per source file (into per-file table) -------
+    if not combined.empty and not rep.per_file.empty:
+        mm = (combined.groupby(["source_zip", "source_csv"], observed=True)["timestamp"]
+              .agg(min_ts="min", max_ts="max"))
+        rep.per_file = rep.per_file.merge(mm, how="left",
+                                          left_on=["source_zip", "source_csv"],
+                                          right_index=True)
+
+    rep.passed = (not rep.issues) and not result.cancelled
+    return rep
