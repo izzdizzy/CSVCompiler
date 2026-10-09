@@ -29,8 +29,12 @@ Tabs
 ----
 * Process              — upload, start button, file-progress bar, current
                          file, ETA, live processing log.
-* Validation / Compare — source vs combined row accounting, missing rows,
-                         duplicate conflicts, missing minute gaps.
+* Validation / Compare — ALWAYS unlocked.  Upload a combined CSV plus one or
+                         more raw ZIP files directly in this tab and press
+                         "Validate & Compare" — no need to run the Process
+                         tab first.  Reports missing rows, unexpected rows,
+                         value mismatches (numeric tolerance) and duplicate
+                         conflicts keyed on (timestamp, kind, area).
 * Logs                 — detailed processing logs, warnings, errors and the
                          final export-stage logs.
 
@@ -105,11 +109,12 @@ def _worker(zip_items, duplicate_mode, tracker):
 
 
 def _manual_validation_worker(combined_uploads, zip_items, tolerance, tracker):
-    """Run the MANUAL validation on a background thread (Validation tab).
+    """Run the manual validation on a background thread (Validation / Compare tab).
 
-    Uses ONLY the files handed to this call — never any Process-tab session
-    state — so results depend solely on what was uploaded in the Validation
-    section.  The finished ManualValidationReport is stashed atomically under
+    Uses ONLY the files uploaded inside the Validation / Compare tab — never
+    any Process-tab session state — so results depend solely on what the user
+    provided here and the tab never requires a prior Process-tab run.
+    The finished ManualValidationReport is stashed atomically under
     "manual_val_result" once the 'manual_val_done' flag is set.
     """
     try:
@@ -279,10 +284,13 @@ with st.sidebar:
     )
 
 # ---------------------------------------------------------------------------
-# Tabs: Process | Validation (manual uploads) | Validation / Compare | Logs
+# Tabs: Process | Validation / Compare | Logs
+# NOTE: the former standalone "Validation" tab was removed — it served the
+# same purpose as "Validation / Compare", so both were merged into this one
+# always-unlocked tab (upload directly here, press "Validate & Compare").
 # ---------------------------------------------------------------------------
-tab_process, tab_manual_validation, tab_validation, tab_logs = st.tabs(
-    ["🛠 Process", "✅ Validation", "🔍 Validation / Compare", "📜 Logs"])
+tab_process, tab_validation, tab_logs = st.tabs(
+    ["🛠 Process", "🔍 Validation / Compare", "📜 Logs"])
 
 # ---------------------------------------------------------------------------
 # Processing (triggered only by the Process button; runs on a worker thread)
@@ -474,125 +482,307 @@ with tab_process:
         st.info("👈 Upload one or more ZIP files in the sidebar and press **Process**.")
 
 # ---------------------------------------------------------------------------
-# Validation / Compare tab
+# Validation / Compare tab — ALWAYS visible and interactive.
+# The user uploads a combined CSV + raw ZIP file(s) directly here and presses
+# "Validate & Compare"; no prior Process-tab run is required.  If inputs are
+# missing, the tab stays open with a helper message and only the button is
+# disabled.
 # ---------------------------------------------------------------------------
 with tab_validation:
-    if result is None:
-        st.info("Run the processor first — validation compares the combined "
-                "output against the original ZIP/CSV sources.")
-    else:
-        report = st.session_state.get("validation_report")
-        if report is None:
-            st.error("Validation could not run: "
-                     f"{st.session_state.get('validation_error', 'unknown error')}")
+    st.subheader("Validate & Compare")
+    st.markdown(
+        "Upload a combined CSV file and one or more ZIP files containing the "
+        "raw CSVs, then press **Validate & Compare**. This works standalone — "
+        "you do not need to run the Process tab first."
+    )
+
+    # ---- Independent uploaders (never locked, never depend on Process) ----
+    val_combined_upload = st.file_uploader(
+        "Combined CSV file",
+        type=["csv"],
+        key="val_combined_csv",
+        help="The combined output CSV (columns: timestamp, kind, area, value, "
+             "optionally source_zip, source_csv).",
+    )
+    val_zip_uploads = st.file_uploader(
+        "Raw ZIP file(s) containing CSVs",
+        type=["zip"],
+        accept_multiple_files=True,
+        key="val_zip_files",
+        help="One or more ZIP archives with the original raw CSV files.",
+    )
+    val_tolerance = st.number_input(
+        "Numeric comparison tolerance (absolute)",
+        min_value=0.0,
+        value=DEFAULT_VALIDATION_TOLERANCE,
+        format="%.10f",
+        key="val_tolerance",
+        help="Values differing by less than this count as equal.",
+    )
+
+    # ---- Helper message + disabled button when inputs are missing ----------
+    # (Requirement: never lock the tab; only disable the button.)
+    missing_inputs = []
+    if val_combined_upload is None:
+        missing_inputs.append("a combined CSV file")
+    if not val_zip_uploads:
+        missing_inputs.append("at least one raw ZIP file")
+
+    val_running = (st.session_state.get("manual_val_thread") is not None
+                   and st.session_state["manual_val_thread"].is_alive())
+
+    if missing_inputs:
+        st.info("To validate, please upload " + " and ".join(missing_inputs) +
+                ". The Validate & Compare button will activate once both are present.")
+
+    validate_clicked = st.button(
+        "Validate & Compare",
+        type="primary",
+        use_container_width=True,
+        disabled=bool(missing_inputs) or val_running,
+    )
+
+    if validate_clicked:
+        # Fresh run markers (clear any previous outcome so stale results don't show).
+        st.session_state.pop("manual_val_result", None)
+        st.session_state.pop("manual_val_error", None)
+        st.session_state["manual_val_done"] = False
+
+        tracker = ProgressTracker(total_files=0, total_rows_hint=0)
+        st.session_state["manual_val_tracker"] = tracker
+        zip_items = [(u.name, u.getvalue()) for u in val_zip_uploads]
+        st.session_state["manual_val_thread"] = threading.Thread(
+            target=_manual_validation_worker,
+            args=([val_combined_upload], zip_items, float(val_tolerance), tracker),
+            daemon=True)
+
+        # Live progress containers repainted in place by _render_progress.
+        st.subheader("Live progress")
+        st.session_state["_mv_bar"] = st.progress(0.0, text="Starting…")
+        st.session_state["_mv_text"] = st.empty()
+        st.session_state["_mv_current"] = st.empty()
+        st.session_state["_mv_rows"] = st.empty()
+        st.session_state["_mv_stage"] = st.empty()
+        mv_log_box = st.empty()   # live log feed for this validation run
+
+        st.session_state["manual_val_thread"].start()
+
+        # ---- Poll loop on the MAIN thread: repaint ~5x/sec, UI stays alive ----
+        while True:
+            _render_progress(tracker, prefix="_mv")
+            _render_live_log(tracker, mv_log_box)
+            if st.session_state.get("manual_val_done"):
+                break
+            time.sleep(0.2)
+
+        # Run finished: tear down live widgets before rendering the report.
+        st.session_state["_mv_bar"].empty()
+        st.session_state["_mv_text"].empty()
+        st.session_state["_mv_current"].empty()
+        st.session_state["_mv_rows"].empty()
+        st.session_state["_mv_stage"].empty()
+        mv_log_box.empty()
+
+    if st.session_state.get("manual_val_error"):
+        st.error(f"Validation failed with an unexpected error: "
+                 f"{st.session_state['manual_val_error']}")
+
+    manual_report = st.session_state.get("manual_val_result")
+    if manual_report is not None:
+        st.divider()
+        st.subheader("Comparison report")
+
+        # Pass/fail banner.
+        if manual_report.passed:
+            st.success("🟢 VALIDATION PASSED — the combined CSV matches the raw "
+                       "ZIP data within tolerance.")
         else:
-            st.subheader("Validation summary")
+            st.error("🔴 VALIDATION FAILED — differences listed below.")
 
-            # Pass/fail banner (requirement: clear status + issues listed anyway).
-            if report.passed:
-                st.success("🟢 VALIDATION PASSED — every parsed source row is "
-                           "accounted for in combined.csv.")
+        if manual_report.issues:
+            with st.expander(f"❗ Issues ({len(manual_report.issues)})", expanded=True):
+                for iss in manual_report.issues:
+                    st.markdown(f"- {iss}")
+        if manual_report.notes:
+            for n in manual_report.notes:
+                st.caption(f"ℹ️ {n}")
+
+        # ---- Headline counts (requirement 8) ----
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        k1.metric("Raw rows parsed", f"{manual_report.total_raw_rows:,}")
+        k2.metric("Combined rows parsed", f"{manual_report.total_combined_rows:,}")
+        k3.metric("Missing rows (raw → combined)", f"{manual_report.missing_count:,}")
+        k4.metric("Unexpected rows (combined only)", f"{manual_report.unexpected_count:,}")
+        k5.metric("Value mismatches", f"{manual_report.mismatch_count:,}")
+        k6.metric("Duplicate conflicts", f"{manual_report.conflict_count:,}")
+
+        st.caption(
+            f"Comparison key: (timestamp, kind, area) · numeric tolerance: "
+            f"{manual_report.tolerance:g} · elapsed: "
+            f"{format_duration(manual_report.elapsed_seconds) or '0s'} · "
+            f"invalid rows skipped: {manual_report.skipped_invalid_count:,} · "
+            f"files with no valid rows: {manual_report.skipped_files_count:,}"
+        )
+
+        # ---- Detail tables: preview capped, full tables downloadable ----
+        def _report_table(title, df, fname, empty_msg):
+            """Render one report section: preview + full-table download."""
+            st.markdown(f"#### {title}")
+            if df is None or df.empty:
+                st.info(empty_msg)
+                return
+            st.dataframe(df.head(VALIDATION_PREVIEW_ROWS),
+                         use_container_width=True, hide_index=True, height=280)
+            if len(df) > VALIDATION_PREVIEW_ROWS:
+                st.caption(f"Showing first {VALIDATION_PREVIEW_ROWS:,} of "
+                           f"{len(df):,} row(s) — download for the full table.")
+                st.download_button(
+                    f"⬇️ Download {fname}",
+                    data=df_to_csv_bytes(df),
+                    file_name=fname,
+                    mime="text/csv",
+                    key=f"dl_{fname}",
+                )
+
+        _report_table("Missing rows (present in raw data, absent from combined CSV)",
+                      manual_report.missing_df, "missing_rows.csv",
+                      "✅ No missing rows detected.")
+        _report_table("Unexpected rows (in combined CSV, absent from raw data)",
+                      manual_report.unexpected_df, "unexpected_rows.csv",
+                      "✅ No unexpected rows detected.")
+        _report_table("Value mismatches (same key, values differ beyond tolerance)",
+                      manual_report.mismatches_df, "value_mismatches.csv",
+                      "✅ No value mismatches detected.")
+        _report_table("Duplicate conflicts (same timestamp+kind+area, different value)",
+                      manual_report.conflicts_df, "duplicate_conflicts.csv",
+                      "✅ No duplicate conflicts detected.")
+        _report_table("Skipped files (produced no valid rows)",
+                      manual_report.skipped_files_df, "skipped_files.csv",
+                      "✅ Every file produced valid rows.")
+        _report_table("Skipped invalid rows (bad date/time, missing/non-numeric value)",
+                      manual_report.skipped_rows_df, "skipped_rows.csv",
+                      "✅ No invalid rows were skipped.")
+        _report_table("Minute coverage gaps per (kind, area)",
+                      manual_report.gaps_df, "coverage_gaps.csv",
+                      "No coverage gaps available (or none detected).")
+        _report_table("Summary",
+                      manual_report.summary_df, "validation_summary.csv",
+                      "(no summary table)")
+
+    # ---- Optional: post-Process auto-validation summary (from the Process run) ----
+    if result is not None:
+        with st.expander("Auto-validation of the last Process-tab run",
+                         expanded=False):
+            report = st.session_state.get("validation_report")
+            if report is None:
+                st.error("Validation could not run: "
+                         f"{st.session_state.get('validation_error', 'unknown error')}")
             else:
-                st.error("🔴 VALIDATION FAILED — issues listed below. You can "
-                         "still inspect the logs and download the output.")
+                # Pass/fail banner (requirement: clear status + issues listed anyway).
+                if report.passed:
+                    st.success("🟢 VALIDATION PASSED — every parsed source row is "
+                               "accounted for in combined.csv.")
+                else:
+                    st.error("🔴 VALIDATION FAILED — issues listed below. You can "
+                             "still inspect the logs and download the output.")
 
-            if report.issues:
-                with st.expander(f"❗ Issues ({len(report.issues)})", expanded=True):
-                    for iss in report.issues:
-                        st.markdown(f"- {iss}")
-            if report.notes:
-                for n in report.notes:
-                    st.caption(f"ℹ️ {n}")
+                if report.issues:
+                    with st.expander(f"❗ Issues ({len(report.issues)})", expanded=True):
+                        for iss in report.issues:
+                            st.markdown(f"- {iss}")
+                if report.notes:
+                    for n in report.notes:
+                        st.caption(f"ℹ️ {n}")
 
-            # ---- Source vs combined row accounting ----
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total source rows (expected)", f"{report.total_source_expected:,}")
-            m2.metric("Valid parsed source rows", f"{report.total_source_parsed:,}")
-            m3.metric("Total combined rows", f"{report.total_combined:,}")
-            diff_ok = (report.row_count_difference ==
-                       report.exact_duplicates_removed + report.conflict_rows_removed)
-            m4.metric("Row count difference (parsed − combined)",
-                      f"{report.row_count_difference:,}",
-                      delta="explained by dedupe ✅" if diff_ok else "UNEXPLAINED ❌")
+                # ---- Source vs combined row accounting ----
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Total source rows (expected)", f"{report.total_source_expected:,}")
+                m2.metric("Valid parsed source rows", f"{report.total_source_parsed:,}")
+                m3.metric("Total combined rows", f"{report.total_combined:,}")
+                diff_ok = (report.row_count_difference ==
+                           report.exact_duplicates_removed + report.conflict_rows_removed)
+                m4.metric("Row count difference (parsed − combined)",
+                          f"{report.row_count_difference:,}",
+                          delta="explained by dedupe ✅" if diff_ok else "UNEXPLAINED ❌")
 
-            m5, m6, m7, m8 = st.columns(4)
-            m5.metric("Artifact rows ignored", f"{report.total_source_dropped:,}")
-            m6.metric("Duplicate rows detected", f"{report.duplicates_detected:,}")
-            m7.metric("Exact duplicates removed", f"{report.exact_duplicates_removed:,}")
-            m8.metric("Conflict groups (diff. values)", f"{report.conflict_groups:,}")
+                m5, m6, m7, m8 = st.columns(4)
+                m5.metric("Artifact rows ignored", f"{report.total_source_dropped:,}")
+                m6.metric("Duplicate rows detected", f"{report.duplicates_detected:,}")
+                m7.metric("Exact duplicates removed", f"{report.exact_duplicates_removed:,}")
+                m8.metric("Conflict groups (diff. values)", f"{report.conflict_groups:,}")
 
-            m9, m10 = st.columns(2)
-            m9.metric("Rows w/ invalid date/time", f"{report.rows_with_invalid_timestamp:,}")
-            m10.metric("Rows w/ missing/invalid value", f"{report.rows_with_invalid_value:,}")
+                m9, m10 = st.columns(2)
+                m9.metric("Rows w/ invalid date/time", f"{report.rows_with_invalid_timestamp:,}")
+                m10.metric("Rows w/ missing/invalid value", f"{report.rows_with_invalid_value:,}")
 
-            # ---- Uploaded ZIPs & CSVs found inside each ----
-            st.markdown("#### Uploaded ZIP files & CSVs found inside")
-            if not report.zip_list.empty:
-                st.dataframe(report.zip_list, use_container_width=True, hide_index=True)
-            else:
-                st.info("No ZIP inventory available (nothing processed).")
+                # ---- Uploaded ZIPs & CSVs found inside each ----
+                st.markdown("#### Uploaded ZIP files & CSVs found inside")
+                if not report.zip_list.empty:
+                    st.dataframe(report.zip_list, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No ZIP inventory available (nothing processed).")
 
-            # ---- Per-source-file expectations vs results ----
-            st.markdown("#### Per source file: expected / parsed / dropped rows, "
-                        "min & max timestamps")
-            if not report.per_file.empty:
-                st.dataframe(report.per_file, use_container_width=True,
-                             hide_index=True, height=320)
-                bad_acct = report.per_file[~report.per_file["accounted"]]
-                if not bad_acct.empty:
-                    st.error(f"{len(bad_acct)} file(s) have unaccounted rows — "
-                             "see the 'accounted' column.")
-            else:
-                st.info("No per-file accounting available.")
+                # ---- Per-source-file expectations vs results ----
+                st.markdown("#### Per source file: expected / parsed / dropped rows, "
+                            "min & max timestamps")
+                if not report.per_file.empty:
+                    st.dataframe(report.per_file, use_container_width=True,
+                                 hide_index=True, height=320)
+                    bad_acct = report.per_file[~report.per_file["accounted"]]
+                    if not bad_acct.empty:
+                        st.error(f"{len(bad_acct)} file(s) have unaccounted rows — "
+                                 "see the 'accounted' column.")
+                else:
+                    st.info("No per-file accounting available.")
 
-            # ---- Missing rows / reconciliation ----
-            st.markdown("#### Missing rows check")
-            unexplained = (report.row_count_difference
-                           - report.exact_duplicates_removed
-                           - report.conflict_rows_removed)
-            if result.cancelled:
-                st.warning("Run was cancelled — the combined output is intentionally "
-                           "incomplete; no missing-row conclusion drawn.")
-            elif unexplained > 0:
-                st.error(f"❌ {unexplained:,} parsed source row(s) are MISSING from "
-                         "combined.csv and cannot be explained by duplicate removal.")
-            elif unexplained < 0:
-                st.error(f"❌ combined.csv contains {-unexplained:,} more row(s) than "
-                         "the source parse count — please inspect the Logs tab.")
-            else:
-                st.success(f"✅ No missing rows: parsed source rows "
-                           f"({report.total_source_parsed:,}) = combined rows "
-                           f"({report.total_combined:,}) + exact duplicates "
-                           f"({report.exact_duplicates_removed:,}) + resolved conflicts "
-                           f"({report.conflict_rows_removed:,}).")
+                # ---- Missing rows / reconciliation ----
+                st.markdown("#### Missing rows check")
+                unexplained = (report.row_count_difference
+                               - report.exact_duplicates_removed
+                               - report.conflict_rows_removed)
+                if result.cancelled:
+                    st.warning("Run was cancelled — the combined output is intentionally "
+                               "incomplete; no missing-row conclusion drawn.")
+                elif unexplained > 0:
+                    st.error(f"❌ {unexplained:,} parsed source row(s) are MISSING from "
+                             "combined.csv and cannot be explained by duplicate removal.")
+                elif unexplained < 0:
+                    st.error(f"❌ combined.csv contains {-unexplained:,} more row(s) than "
+                             "the source parse count — please inspect the Logs tab.")
+                else:
+                    st.success(f"✅ No missing rows: parsed source rows "
+                               f"({report.total_source_parsed:,}) = combined rows "
+                               f"({report.total_combined:,}) + exact duplicates "
+                               f"({report.exact_duplicates_removed:,}) + resolved conflicts "
+                               f"({report.conflict_rows_removed:,}).")
 
-            # ---- Duplicate conflicts ----
-            st.markdown("#### Duplicate timestamp+area conflicts "
-                        "(same key, different value)")
-            if not report.duplicate_conflicts.empty:
-                st.warning(f"{report.conflict_groups} conflict group(s) detected; "
-                           f"{report.conflict_rows_removed} row(s) resolved via "
-                           f"'{result.duplicate_mode}'. Rows involved:")
-                st.dataframe(report.duplicate_conflicts, use_container_width=True,
-                             hide_index=True, height=280)
-            else:
-                st.success("No conflicting duplicates (exact duplicates were "
-                           "collapsed safely where applicable).")
+                # ---- Duplicate conflicts ----
+                st.markdown("#### Duplicate timestamp+area conflicts "
+                            "(same key, different value)")
+                if not report.duplicate_conflicts.empty:
+                    st.warning(f"{report.conflict_groups} conflict group(s) detected; "
+                               f"{report.conflict_rows_removed} row(s) resolved via "
+                               f"'{result.duplicate_mode}'. Rows involved:")
+                    st.dataframe(report.duplicate_conflicts, use_container_width=True,
+                                 hide_index=True, height=280)
+                else:
+                    st.success("No conflicting duplicates (exact duplicates were "
+                               "collapsed safely where applicable).")
 
-            # ---- Missing minute gaps ----
-            st.markdown("#### Missing minute gaps per (kind, area)")
-            if not report.coverage_checked:
-                st.info("No data available for coverage analysis.")
-            elif report.coverage_gaps.empty:
-                st.success("✅ No missing minutes detected — every (kind, area) series "
-                           "looks continuous (one row per minute).")
-            else:
-                st.warning(f"⚠️ {int(report.coverage_gaps['missing_minutes'].sum()):,} "
-                           "missing minute(s) across "
-                           f"{len(report.coverage_gaps)} series — likely sensor "
-                           "dropout in the source data, not a processing bug:")
-                st.dataframe(report.coverage_gaps, use_container_width=True,
-                             hide_index=True, height=280)
+                # ---- Missing minute gaps ----
+                st.markdown("#### Missing minute gaps per (kind, area)")
+                if not report.coverage_checked:
+                    st.info("No data available for coverage analysis.")
+                elif report.coverage_gaps.empty:
+                    st.success("✅ No missing minutes detected — every (kind, area) series "
+                               "looks continuous (one row per minute).")
+                else:
+                    st.warning(f"⚠️ {int(report.coverage_gaps['missing_minutes'].sum()):,} "
+                               "missing minute(s) across "
+                               f"{len(report.coverage_gaps)} series — likely sensor "
+                               "dropout in the source data, not a processing bug:")
+                    st.dataframe(report.coverage_gaps, use_container_width=True,
+                                 hide_index=True, height=280)
 
 # ---------------------------------------------------------------------------
 # Logs tab: detailed processing logs, warnings, errors, final-export stages
