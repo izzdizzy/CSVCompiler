@@ -516,7 +516,7 @@ def parse_timestamp(dates, times):
 
 
 def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
-                     progress=None):
+                     progress=None, ts_col=None):
     """Turn raw CSV rows into a tidy DataFrame of output records.
 
     Returns ``(df_or_None, rows_read, error_message_or_None, artifacts)`` where
@@ -531,6 +531,11 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
     runs in *chunks* so live counters (rows read/kept/dropped for the current
     file) update continuously and cancellation can stop mid-file — this keeps
     memory flat and the UI responsive even on very large CSVs.
+
+    `ts_col` (optional): index of a single combined timestamp column.  When
+    given (used by the manual Validation-tab ZIP parsing), date/time columns
+    are NOT required; the row's timestamp is read from `ts_col` instead and
+    parsed directly with ``pd.to_datetime``.
     """
     art = ArtifactCounts()
     if not rows:
@@ -546,7 +551,9 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
 
     rows = rows[content_idx:]
     header_row = rows[0]
-    has_header = looks_like_header(header_row)
+    # A row that looks like a header but is actually a *separator artifact*
+    # (e.g. '---,---,---') must not be treated as the header line.
+    has_header = looks_like_header(header_row) and not looks_like_separator(header_row)
 
     col_title = col_value = col_date = col_time = None
     if has_header:
@@ -556,16 +563,30 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
             col_value = idx["value"]
             col_date = idx["date"]
             col_time = idx["time"]
+        elif ts_col is not None:
+            # Manual-validation mode: headers exist but lack separate date/time
+            # columns — fall back to positional value/title plus the caller-
+            # supplied single timestamp column index.
+            norm_hdr = [str(c).strip().lower() for c in header_row]
+            col_value = next((i for i, n in enumerate(norm_hdr)
+                              if any(kw in n for kw in VALUE_KEYWORDS)), 1)
+            col_title = next((i for i, n in enumerate(norm_hdr)
+                              if any(kw in n for kw in TITLE_KEYWORDS)), None)
         else:
             # Headers exist but are unclear -> fall back to positions
             log_fn(f"{source_zip}/{source_csv}: headers unclear, using positional columns")
             has_header = False
     if not has_header:
-        col_title, col_value, col_date, col_time = 0, 1, 2, 3
+        if ts_col is not None:
+            # Headerless + combined-timestamp layout: 0=title, 1=value, ts=ts_col
+            col_title, col_value = 0, 1
+        else:
+            col_title, col_value, col_date, col_time = 0, 1, 2, 3
 
     data_rows = rows[1:] if has_header else rows
     width = max((len(r) for r in data_rows), default=0)
-    needed = max(i for i in (col_title, col_value, col_date, col_time) if i is not None) + 1
+    needed_cols = (col_title, col_value, col_date, col_time, ts_col)
+    needed = max(i for i in needed_cols if i is not None) + 1
     if width < needed:
         return None, 0, f"not enough columns (found {width}, need {needed})", art
 
@@ -622,6 +643,7 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
             val_raw = str(cell(r, col_value)).strip()
             date_raw = str(cell(r, col_date)).strip()
             time_raw = str(cell(r, col_time)).strip()
+            ts_raw = str(cell(r, ts_col)).strip() if ts_col is not None else ""
             title_raw = str(cell(r, col_title)).strip() if col_title is not None else ""
 
             # Repeated header-like rows inside the data (page breaks) -> skip
@@ -630,12 +652,20 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
                 art.repeated_header_rows += 1
                 continue
 
-            # Malformed: not enough columns to even reach date/time/value
-            if len(r) <= max(col_value, col_date, col_time):
+            # Malformed: not enough columns to even reach value/timestamp
+            max_required = max(i for i in (col_value, ts_col if ts_col is not None
+                                           else max(col_date, col_time)) if i is not None)
+            if len(r) <= max_required:
                 art.malformed_rows += 1
                 continue
 
-            if date_raw == "" or time_raw == "":
+            if ts_col is not None:
+                # Single combined timestamp column (manual-validation mode).
+                if ts_raw == "":
+                    # Missing timestamp/date/time -> unusable row
+                    art.malformed_rows += 1
+                    continue
+            elif date_raw == "" or time_raw == "":
                 # Missing date/time -> unusable row (often part of an artifact)
                 art.malformed_rows += 1
                 continue
@@ -653,16 +683,32 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
             # Timestamp must parse; rows failing the fast path are queued for
             # ONE vectorised flexible-parse pass after the scan (and only
             # counted as bad_timestamp_rows if that fallback fails too).
-            ts = _try_parse_ts(date_raw, time_raw)
-            if ts is None:
-                pending.append((len(recs), date_raw, time_raw))
-                recs.append((None, title_raw, value))  # placeholder, filled below
-                art.parsed_rows += 1                   # provisional; corrected later
-                rows_kept_chunk += 1
+            if ts_col is not None:
+                ts = pd.to_datetime(ts_raw, format="%m/%d/%y %I:%M:%S %p",
+                                    errors="coerce")
+                if pd.isna(ts):
+                    ts = pd.to_datetime(ts_raw, format="%Y-%m-%d %H:%M:%S",
+                                        errors="coerce")
+                if pd.isna(ts):
+                    pending.append((len(recs), ts_raw, ""))
+                    recs.append((None, title_raw, value))  # placeholder
+                    art.parsed_rows += 1                   # provisional
+                    rows_kept_chunk += 1
+                else:
+                    recs.append((ts, title_raw, value))
+                    art.parsed_rows += 1
+                    rows_kept_chunk += 1
             else:
-                recs.append((ts, title_raw, value))
-                art.parsed_rows += 1
-                rows_kept_chunk += 1
+                ts = _try_parse_ts(date_raw, time_raw)
+                if ts is None:
+                    pending.append((len(recs), date_raw, time_raw))
+                    recs.append((None, title_raw, value))  # placeholder, filled below
+                    art.parsed_rows += 1                   # provisional; corrected later
+                    rows_kept_chunk += 1
+                else:
+                    recs.append((ts, title_raw, value))
+                    art.parsed_rows += 1
+                    rows_kept_chunk += 1
 
         rows_read = min(start + CHUNK, len(data_rows))
         if progress is not None:
@@ -677,7 +723,9 @@ def process_csv_rows(rows, kind, area_from_name, source_zip, source_csv, log_fn,
     # a per-row format guess — keeps large-file scans fast and exact.
     if pending:
         idxs = [i for i, _d, _t in pending]
-        strs = pd.Series([d + " " + t for _i, d, t in pending])
+        # ts_col mode stores the whole timestamp string in the "date" slot;
+        # date/time mode concatenates the two fields as before.
+        strs = pd.Series([d + (" " + t if t else "") for _i, d, t in pending])
         try:
             parsed = pd.to_datetime(strs, errors="coerce", format=None)
         except Exception:

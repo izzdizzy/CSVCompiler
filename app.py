@@ -57,6 +57,16 @@ from processor import (
     write_combined_csv,
 )
 
+# Manual-validation engine (standalone "Validation" tab): validates manually
+# uploaded combined CSV file(s) against manually uploaded ZIP file(s) without
+# depending on any session state from the Process tab.
+from validation import (
+    DEFAULT_VALIDATION_TOLERANCE,
+    VALIDATION_PREVIEW_ROWS,
+    df_to_csv_bytes,
+    run_manual_validation,
+)
+
 # ---------------------------------------------------------------------------
 # Page setup
 # ---------------------------------------------------------------------------
@@ -92,6 +102,25 @@ def _worker(zip_items, duplicate_mode, tracker):
         st.session_state["run_error"] = f"{type(e).__name__}: {e}"
     finally:
         st.session_state["run_done"] = True
+
+
+def _manual_validation_worker(combined_uploads, zip_items, tolerance, tracker):
+    """Run the MANUAL validation on a background thread (Validation tab).
+
+    Uses ONLY the files handed to this call — never any Process-tab session
+    state — so results depend solely on what was uploaded in the Validation
+    section.  The finished ManualValidationReport is stashed atomically under
+    "manual_val_result" once the 'manual_val_done' flag is set.
+    """
+    try:
+        report = run_manual_validation(combined_uploads, zip_items,
+                                       tolerance=tolerance, progress=tracker)
+        st.session_state["manual_val_result"] = report
+    except Exception as e:
+        # Last-resort guard: surface unexpected errors instead of hanging the UI.
+        st.session_state["manual_val_error"] = f"{type(e).__name__}: {e}"
+    finally:
+        st.session_state["manual_val_done"] = True
 
 
 def _render_progress(tracker):
@@ -239,10 +268,10 @@ with st.sidebar:
     )
 
 # ---------------------------------------------------------------------------
-# Tabs: Process | Validation / Compare | Logs
+# Tabs: Process | Validation (manual uploads) | Validation / Compare | Logs
 # ---------------------------------------------------------------------------
-tab_process, tab_validation, tab_logs = st.tabs(
-    ["🛠 Process", "🔍 Validation / Compare", "📜 Logs"])
+tab_process, tab_manual_validation, tab_validation, tab_logs = st.tabs(
+    ["🛠 Process", "✅ Validation", "🔍 Validation / Compare", "📜 Logs"])
 
 # ---------------------------------------------------------------------------
 # Processing (triggered only by the Process button; runs on a worker thread)
