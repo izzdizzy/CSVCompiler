@@ -618,10 +618,33 @@ def run_manual_validation(combined_uploads, zip_items,
             parts.append(df[c].fillna("").astype(str))
         return _key_digest(pd.concat(parts, axis=1).agg("|".join, axis=1))
 
+    # The RAW side always carries source_zip/source_csv, but the CLEANED frame
+    # can lose them when the ZIP parse produced no rows (empty-data edge case).
+    # Guarantee both frames hold every scoping column so key building never
+    # hits a missing column on either side.
+    for _c in scope_cols:
+        if _c not in raw_clean.columns:
+            raw_clean[_c] = ""
+        if _c not in combined.columns:
+            combined[_c] = ""
     raw_view = raw_clean.copy()
     raw_view["_key"] = make_keys(raw_view)
     comb_view = combined.copy()
     comb_view["_key"] = make_keys(comb_view)
+
+    # ---- Preserve readable key columns through the outer merge ------------
+    # Grouping keeps the key columns, but an OUTER merge fills them with NaN
+    # whenever a key exists on only one side (missing / unexpected rows).
+    # Hash the digest back to a compact per-side "key" string so every report
+    # table shows timestamp/kind/area even for one-sided rows.
+    raw_d2k = (raw_view.drop_duplicates("_key")
+               .set_index("_key")["timestamp"].astype(str) + "|"
+               + raw_view.drop_duplicates("_key").set_index("_key")["kind"]
+               + "|" + raw_view.drop_duplicates("_key").set_index("_key")["area"])
+    comb_d2k = (comb_view.drop_duplicates("_key")
+                .set_index("_key")["timestamp"].astype(str) + "|"
+                + comb_view.drop_duplicates("_key").set_index("_key")["kind"]
+                + "|" + comb_view.drop_duplicates("_key").set_index("_key")["area"])
 
     # ---- Raw-side duplicate conflicts (already grouped by cleaner) -------
     conf_frames = []
@@ -631,11 +654,18 @@ def run_manual_validation(combined_uploads, zip_items,
         conf_frames.append(rc)
 
     # ---- Group by key and reconcile values within tolerance --------------
-    group_cols = ["_key"] + key_cols
-    raw_g = (raw_view.groupby(group_cols, sort=False, observed=True)["value"]
-             .agg(list).reset_index())
-    comb_g = (comb_view.groupby(group_cols, sort=False, observed=True)["value"]
-              .agg(list).reset_index())
+    # NOTE: group ONLY on "_key" — the human-readable key columns are carried
+    # along as aggregation payloads (first value), which guarantees identical
+    # groupings on both sides and no column-name collisions in the merge.
+    def _group_by_key(df):
+        g = df.groupby("_key", sort=False)["value"].agg(list).reset_index()
+        info = df.drop_duplicates("_key").set_index("_key")
+        for c in key_cols:
+            g[c] = g["_key"].map(info[c])
+        return g
+
+    raw_g = _group_by_key(raw_view)
+    comb_g = _group_by_key(comb_view)
 
     merged = raw_g.merge(comb_g, on="_key", how="outer", suffixes=("_raw", "_comb"))
 
@@ -643,7 +673,28 @@ def run_manual_validation(combined_uploads, zip_items,
     for _, mrow in merged.iterrows():
         rv = mrow["value_raw"] if isinstance(mrow["value_raw"], list) else []
         cv = mrow["value_comb"] if isinstance(mrow["value_comb"], list) else []
-        base = {c: mrow.get(c) for c in key_cols}
+
+        # Reconstruct readable key columns.  Because we group only on "_key",
+        # each side's merge column is named "<col>_raw" / "<col>_comb"; when
+        # scope_cols are present they exist on BOTH sides and need the suffix
+        # handling below (the plain `mrow[c]` fallback would be ambiguous).
+        base = {}
+        for c in key_cols:
+            v_raw = mrow.get(f"{c}_raw")
+            v_comb = mrow.get(f"{c}_comb")
+            if pd.notna(v_raw):
+                base[c] = v_raw
+            elif pd.notna(v_comb):
+                base[c] = v_comb
+            else:
+                base[c] = None
+        if all(v is None for v in base.values()):
+            # Defensive fallback: rebuild the readable keys from the digest map.
+            kstr = raw_d2k.get(mrow["_key"], comb_d2k.get(mrow["_key"], ""))
+            pieces = str(kstr).split("|", 2)
+            base = dict(zip(key_cols[:3], pieces + [None] * (3 - len(pieces))))
+            for c in key_cols[3:]:
+                base[c] = None
         if not cv:
             # Key exists only in the raw ZIP data -> MISSING from combined.
             for v in rv:
