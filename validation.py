@@ -346,6 +346,14 @@ def load_raw_from_zips(zip_items, progress=None):
         (``process_csv_rows``), extended with a single-column 'timestamp'
         fallback for raw exports that carry one combined timestamp.
 
+    Live-progress contract (when `progress` is a ProgressTracker):
+      * ``set_current_file()`` / ``finish_file()`` are called once per CSV so
+        the UI's file-completion bar ticks after EVERY file — including ones
+        that end up skipped or corrupted;
+      * ``add_rows()`` reports scanned/kept rows per file (secondary info);
+      * ``stage()`` lines are deduplicated by the tracker itself, so warnings
+        like "Could not infer kind ..." appear exactly once per ZIP.
+
     Returns ``(raw_df, skipped_df, artifact_totals)``.
     """
     frames = []
@@ -356,10 +364,44 @@ def load_raw_from_zips(zip_items, progress=None):
 
     def log_fn(msg):
         # Parser chatter surfaces through the live stage log when provided.
+        # ``ProgressTracker.stage`` deduplicates identical lines internally, so
+        # a warning such as "Could not infer kind for ZIP ..." is shown ONCE
+        # per ZIP (never repeated for every CSV inside that ZIP).  Without a
+        # tracker nothing is printed — but never crash either.
         if progress is not None:
-            progress.stage(msg)
+            try:
+                progress.stage(msg)
+            except Exception:
+                pass
+
+    def _file_done(status):
+        """Advance the file-based progress bar (no-op without a tracker)."""
+        if progress is not None:
+            try:
+                progress.finish_file(status=status)
+            except Exception:
+                pass
 
     items = sorted(zip_items, key=lambda t: str(t[0]))
+
+    # ---- Pre-scan: count ALL CSV entries up front ------------------------
+    # The exact total drives the primary progress bar (completed files /
+    # total files) so it can be rendered before any parsing starts.  Corrupt
+    # archives simply contribute 0 here and are reported during the main pass.
+    if progress is not None:
+        total_csvs = 0
+        for _name, payload in items:
+            try:
+                with zipfile.ZipFile(io.BytesIO(payload)) as zf_pre:
+                    total_csvs += sum(1 for finfo in zf_pre.infolist()
+                                      if finfo.filename.lower().endswith(".csv")
+                                      and not finfo.filename.endswith("/"))
+            except Exception:
+                continue
+        if total_csvs:
+            progress._total_files = total_csvs
+
+    file_index = 0  # 1-based counter across all CSVs in all ZIPs ("file i of N")
     for zi, (zip_name, payload) in enumerate(items):
         zip_name = str(zip_name)
         if progress is not None:
@@ -387,9 +429,18 @@ def load_raw_from_zips(zip_items, progress=None):
                                          reason="no CSV files inside ZIP"))
                 continue
 
+            # Kind inferred ONCE per ZIP; the tracker's dedupe guarantees the
+            # "unknown kind" warning is logged once per ZIP, not per CSV.
             kind = infer_kind(zip_name, log_fn)
             for entry in entries:
                 inner_name = os.path.basename(entry)
+                file_index += 1
+                if progress is not None:
+                    try:
+                        progress.set_current_file(zip_name, inner_name, file_index)
+                    except Exception:
+                        pass
+                status = "error"  # flipped to "ok"/"skipped" below
                 area_from_name = re.sub(r"\.csv$", "", inner_name, flags=re.IGNORECASE)
                 if not area_from_name or not re.search(r"[A-Za-z0-9]", area_from_name):
                     area_from_name = None  # filename not useful as area
@@ -404,22 +455,28 @@ def load_raw_from_zips(zip_items, progress=None):
                         if "timestamp" in norm0:
                             ts_col = norm0.index("timestamp")
                             break
-                    df, _rows_read, err, art = process_csv_rows(
+                    df, rows_read, err, art = process_csv_rows(
                         rows, kind, area_from_name, zip_name, inner_name,
-                        log_fn, ts_col=ts_col)
+                        log_fn, ts_col=ts_col, progress=progress)
                     for k in totals:
                         totals[k] += getattr(art, k)
                     if df is None or df.empty:
+                        status = "skipped"
                         skipped_rows.append(dict(
                             file=zip_name, entry=entry,
                             reason=err or "empty file or no valid rows"))
                         continue
+                    status = "ok"
                     frames.append(df)
                 except Exception as e:
                     # A single unreadable entry must never abort the run.
+                    status = "error"
                     skipped_rows.append(dict(
                         file=zip_name, entry=entry,
                         reason=f"error reading entry: {type(e).__name__}: {e}"))
+                finally:
+                    # One unit of work finished -> tick the file-based bar.
+                    _file_done(status)
 
     if frames:
         raw = pd.concat(frames, ignore_index=True)

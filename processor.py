@@ -254,7 +254,8 @@ class ProgressTracker:
         self.last_eta_basis = None
 
         # ---- final-stage (combining/export) visible logging ----
-        self._stage_logs = []          # list of (elapsed_at_log, message) tuples
+        self._stage_logs = []          # list of (elapsed_at_log, message[, count]) tuples
+        self._stage_index = {}         # message -> position in _stage_logs (dedupe map)
         self.current_stage = ""        # e.g. "writing combined.csv"
 
     # -- cooperative cancellation -------------------------------------
@@ -323,10 +324,27 @@ class ProgressTracker:
         The UI polls ``snapshot()["stage_logs"]`` and repaints, so the page
         keeps updating (never appears frozen) while the big DataFrame work
         happens after the last file has been processed.
+
+        DEDUPLICATION (requirement 7): identical messages are never appended
+        twice.  A repeated message updates the ORIGINAL entry instead — its
+        timestamp refreshes to "last seen" and a ``(repeated Nx)`` suffix is
+        added when it occurred more than once.  This guarantees one warning
+        shows up exactly once per ZIP/file, no matter how often it is emitted
+        internally (e.g. mirrored through several logging layers).
         """
         with self._lock:
             elapsed = time.monotonic() - self.started_at
-            self._stage_logs.append((elapsed, msg))
+            base = msg.split(" (repeated ")[0]      # strip our own count suffix
+            pos = self._stage_index.get(base)
+            if pos is not None:
+                # Already logged once: bump the repeat counter in place and
+                # refresh the timestamp so the tail shows the latest activity.
+                _t, _m, n = self._stage_logs[pos]
+                shown = f"{base} (repeated {n + 1}x)" if n + 1 > 1 else base
+                self._stage_logs[pos] = (elapsed, shown, n + 1)
+            else:
+                self._stage_index[base] = len(self._stage_logs)
+                self._stage_logs.append((elapsed, msg, 1))
             self.current_stage = msg
 
     def _avg_seconds_per_file(self):
@@ -386,7 +404,11 @@ class ProgressTracker:
                 "last_file_status": self.last_file_status,
                 "total_rows_hint": self._total_rows_hint,  # 0 => unknown (secondary)
                 "cancelled": self._cancel.is_set(),
-                "stage_logs": list(self._stage_logs),      # final-export visibility
+                # Final-export visibility: DEDUPLICATED (time, message) pairs —
+                # the internal repeat counter is folded into the message text
+                # ("(repeated Nx)") so downstream consumers keep the simple
+                # 2-tuple format and never render the same line twice.
+                "stage_logs": [(t, m) for t, m, _n in self._stage_logs],
                 "current_stage": self.current_stage,
             }
 
@@ -897,7 +919,10 @@ def process_zips(zip_items, duplicate_mode: str = "keep last",
     def log_fn(msg):
         messages.append(msg)
         if progress is not None:
-            # Mirror processing notes into the live Logs feed too.
+            # Mirror processing notes into the live Logs feed too.  NOTE: we
+            # deliberately do NOT append here — ``stage()`` below already does
+            # (see `stage()`), which used to duplicate every parser message in
+            # the final log ("Could not infer kind..." appearing twice).
             progress.stage(msg)
 
     frames = []          # collected per-CSV DataFrames, concatenated ONCE at the end
@@ -907,7 +932,11 @@ def process_zips(zip_items, duplicate_mode: str = "keep last",
         """Emit a visible final-stage log line (also lands in `messages`)."""
         if progress is not None:
             progress.stage(msg)
-        messages.append(msg)
+        # Append only when it isn't already the newest message — prevents the
+        # same completion/writing line from being recorded twice when callers
+        # route their output through both log_fn and stage().
+        if not messages or messages[-1] != msg:
+            messages.append(msg)
 
     # Deterministic ordering makes runs reproducible.
     items = sorted(zip_items, key=lambda t: str(t[0]))
