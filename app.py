@@ -61,12 +61,12 @@ from processor import (
     write_combined_csv,
 )
 
-# Manual-validation engine (standalone "Validation" tab): validates manually
-# uploaded combined CSV file(s) against manually uploaded ZIP file(s) without
-# depending on any session state from the Process tab.
+# Manual-validation engine (Validation / Compare tab): validates the combined
+# CSV against the source files stored in st.session_state by the Process tab.
 from validation import (
     DEFAULT_VALIDATION_TOLERANCE,
     VALIDATION_PREVIEW_ROWS,
+    UploadStub,
     df_to_csv_bytes,
     run_manual_validation,
 )
@@ -74,7 +74,7 @@ from validation import (
 # ---------------------------------------------------------------------------
 # Page setup
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="ZIP to Combined CSV", page_icon="🗜️", layout="wide")
+st.set_page_config(page_title="ZIP to Combined CSV", page_icon=":material/folder_zip:", layout="wide")
 
 st.title("ZIP to Combined CSV")
 st.caption(
@@ -158,42 +158,44 @@ def _render_progress(tracker, prefix: str = "_pb", show_final_stage: bool = True
     if fraction is None:
         # Indeterminate state: total file count not known yet (pre-scan
         # still running).  Show an animated bar rather than failing/lying.
-        bar.progress(None, text="Scanning ZIP archives… counting files")
+        bar.progress(None, text="Scanning archives... counting files")
     else:
         bar.progress(fraction,
-                     text=(f"Files completed: **{done} of {total_files}**{pct_txt}"))
+                     text=(f"Files completed: {done} of {total_files} "
+                           f"({fraction * 100:.0f}%)"))
 
     # ---- Live status line: elapsed / ETA (avg time per file) ----
-    parts = [f"🧾 Files completed: **{done} of {total_files or '?'}**",
-             f"✅ {fraction * 100:.1f}% complete" if fraction is not None
-             else "⏳ Estimating…"]
-    parts.append(f"⏱️ Elapsed **{format_duration(snap['elapsed']) or '0s'}**")
+    parts = [f"Files completed: **{done} of {total_files or '?'}**",
+             f"{fraction * 100:.1f}% complete" if fraction is not None
+             else "Estimating..."]
+    parts.append(f"Elapsed: **{format_duration(snap['elapsed']) or '0s'}**")
     if snap["eta_seconds"] is not None:
         spf = snap.get("avg_seconds_per_file")
         spf_txt = f" | avg {spf:.1f}s/file" if spf else ""
-        parts.append(f"🔮 ETA **{format_duration(snap['eta_seconds'])}**{spf_txt}")
+        parts.append(f"Estimated time remaining: **{format_duration(snap['eta_seconds'])}**{spf_txt}")
     else:
-        parts.append("🔮 ETA calculating… (needs ≥1 finished file)")
+        parts.append("Estimated time remaining: calculating... (needs at least 1 finished file)")
     txt.markdown("  |  ".join(parts))
 
     # ---- Current file line (+ last file's success/failure status) ----
     # NOTE: real newline characters here — Streamlit renders them as line
     # breaks (the old double-backslash version showed literal "\\n" text).
-    status_icons = {"ok": "✅ ok", "skipped": "⚠️ skipped", "error": "❌ error"}
-    last_status = status_icons.get(snap["last_file_status"], "")
+    status_labels = {"ok": "ok", "skipped": "skipped", "error": "error"}
+    last_status = status_labels.get(snap["last_file_status"], "")
     if snap["current_zip"] or snap["current_csv"]:
         idx = min(done + 1, total_files) if total_files else done + 1
-        counter = (f"Processing file **{idx} of {total_files}**"
-                   if total_files else f"Processing file **{idx}**")
+        counter = (f"Current file number: **{idx} of {total_files}**"
+                   if total_files else f"Current file number: **{idx}**")
         lines = [counter,
-                 f"📦 Current ZIP: `{snap['current_zip'] or '—'}`",
-                 f"📄 Current CSV: `{snap['current_csv'] or '—'}`",
+                 f"Current file name: `{snap['current_csv'] or snap['current_zip'] or '-'}`",
                  f"Rows scanned in current file: **{snap['current_rows']:,}**"]
+        if snap["current_zip"] and snap["current_csv"]:
+            lines.insert(2, f"Current archive: `{snap['current_zip']}`")
         if last_status:
             lines.append(f"Last file status: {last_status}")
         cur.markdown("\n".join(lines))
     else:
-        cur.markdown("Opening ZIP archive(s)…")
+        cur.markdown("Opening archive(s)...")
 
     # ---- Secondary info: row counts (NOT the progress basis) ----
     kept, dropped = snap["rows_kept"], snap["rows_dropped"]
@@ -201,8 +203,8 @@ def _render_progress(tracker, prefix: str = "_pb", show_final_stage: bool = True
     total_hint = snap["total_rows_hint"]
     hint_txt = f" (~{total_hint:,} est.)" if total_hint else ""
     rows.markdown(
-        f"_Secondary info — rows:_ scanned **{seen:,}{hint_txt}**  |  "
-        f"✅ valid so far: **{kept:,}**  |  ❌ dropped so far: **{dropped:,}**"
+        f"_Secondary info - rows:_ scanned **{seen:,}{hint_txt}**  |  "
+        f"valid so far: **{kept:,}**  |  dropped so far: **{dropped:,}**"
     )
 
     # ---- Final-stage visibility: live log lines during combining/export ----
@@ -213,7 +215,7 @@ def _render_progress(tracker, prefix: str = "_pb", show_final_stage: bool = True
             # Deduplicated already by ProgressTracker.stage(); rendered with
             # real line breaks inside a fenced code block (no visible escapes).
             lines = "\n".join(f"[{t:6.1f}s] {m}" for t, m in tail)
-            stage_box.markdown("**🛠 Final stage (live):**\n```\n" + lines + "\n```")
+            stage_box.markdown("**Final stage (live):**\n```\n" + lines + "\n```")
         else:
             stage_box.markdown("")
     return snap
@@ -223,7 +225,7 @@ def _render_live_log(tracker, container, n_lines: int = 12):
     """Show the tail of the live stage/processing log feed in `container`."""
     logs = tracker.snapshot()["stage_logs"]
     if not logs:
-        container.code("(waiting for log output…)", language="log")
+        container.code("(waiting for log output...)", language="log")
         return
     tail = logs[-n_lines:]
     text = "\n".join(f"[{t:7.1f}s] {m}" for t, m in tail)
@@ -231,22 +233,33 @@ def _render_live_log(tracker, container, n_lines: int = 12):
 
 
 # ---------------------------------------------------------------------------
-# Sidebar: inputs & options
+# Tabs: Process | Validation / Compare | Logs
+# All file upload controls live INSIDE the Process tab only — nothing is
+# permanently visible on the left/sidebar.  The Validation / Compare tab
+# reuses the files stored in st.session_state by the Process tab.
 # ---------------------------------------------------------------------------
-with st.sidebar:
-    st.header("Inputs")
+tab_process, tab_validation, tab_logs = st.tabs(
+    ["Process", "Validation / Compare", "Logs"])
 
-    # Requirement 4: support MULTIPLE uploaded ZIP files at once.
+# ---------------------------------------------------------------------------
+# Process tab: upload controls, options and start buttons (in-tab only)
+# ---------------------------------------------------------------------------
+with tab_process:
+    st.subheader("Upload source files")
+
+    # Support MULTIPLE uploaded ZIP or CSV files at once (this uploader is
+    # the ONLY file input in the app; it lives inside the Process tab).
     uploads = st.file_uploader(
-        "ZIP files (may contain nested folders of CSVs)",
-        type=["zip"],
+        "Source files (ZIP archives containing CSVs, or plain CSV files; "
+        "nested folders allowed)",
+        type=["zip", "csv"],
         accept_multiple_files=True,
-        help="Each ZIP should contain one or more .csv files. Non-CSV entries are ignored.",
+        key="process_uploads",
+        help="Each ZIP should contain one or more .csv files. Non-CSV entries "
+             "are ignored. Plain CSV files are accepted directly.",
     )
 
-    st.header("Options")
-
-    # Requirement 8: duplicate handling dropdown, default "keep last".
+    # Duplicate handling dropdown, default "keep last".
     # Duplicates are keyed on (timestamp, kind, area).
     duplicate_mode = st.selectbox(
         "Duplicate handling (by timestamp + kind + area)",
@@ -259,7 +272,7 @@ with st.sidebar:
         ),
     )
 
-    # Requirement: an explicit Process/start button (nothing runs until clicked).
+    # An explicit Process/start button (nothing runs until clicked).
     running = st.session_state.get("run_thread") is not None and \
               st.session_state["run_thread"].is_alive()
     process_clicked = st.button("Process", type="primary",
@@ -267,30 +280,20 @@ with st.sidebar:
                                 disabled=running)
 
     # Optional improvement: cancel button (only active while a run is going).
-    cancel_clicked = st.button("⏹ Cancel", use_container_width=True,
+    cancel_clicked = st.button("Cancel", use_container_width=True,
                                disabled=not running)
     if cancel_clicked:
         tracker = st.session_state.get("run_tracker")
         if tracker is not None:
             tracker.cancel()  # cooperative: worker stops at the next chunk/file
-            st.toast("Cancellation requested — stopping after current chunk…")
+            st.toast("Cancellation requested - stopping after current chunk...")
 
-    st.divider()
-    st.markdown(
-        "**kind** is inferred from the ZIP filename (e.g. `btu` → BTU, "
-        "`temp` → Temperature); otherwise `unknown`.  \n"
+    st.caption(
+        "**kind** is inferred from the archive/filename (e.g. `btu` -> BTU, "
+        "`temp` -> Temperature); otherwise `unknown`.  \n"
         "**area** is the CSV filename without extension; falls back to the "
         "tag/title column, then to `source_csv`."
     )
-
-# ---------------------------------------------------------------------------
-# Tabs: Process | Validation / Compare | Logs
-# NOTE: the former standalone "Validation" tab was removed — it served the
-# same purpose as "Validation / Compare", so both were merged into this one
-# always-unlocked tab (upload directly here, press "Validate & Compare").
-# ---------------------------------------------------------------------------
-tab_process, tab_validation, tab_logs = st.tabs(
-    ["🛠 Process", "🔍 Validation / Compare", "📜 Logs"])
 
 # ---------------------------------------------------------------------------
 # Processing (triggered only by the Process button; runs on a worker thread)
@@ -299,11 +302,16 @@ with tab_process:
     if process_clicked:
         if not uploads:
             # Basic guard: nothing uploaded yet.
-            st.warning("Please upload at least one ZIP file before pressing Process.")
+            st.warning("Please upload at least one file before pressing Process.")
         else:
             # Build (name, bytes) pairs for the processor; reading the uploaded
             # files happens exactly once per file (no repeated loops).
             zip_items = [(u.name, u.getvalue()) for u in uploads]
+
+            # Remember the uploaded files (name + bytes) in session state so
+            # the Validation / Compare tab can reuse them WITHOUT its own
+            # file uploader.
+            st.session_state["source_files"] = list(zip_items)
 
             # Fresh run state (clear any previous outcome markers).
             tracker = ProgressTracker(total_files=0, total_rows_hint=0)
@@ -361,7 +369,7 @@ with tab_process:
                     else:
                         # Clear completion message including the export stage time.
                         st.success(
-                            f"✅ Done — processing took {format_duration(result.elapsed_seconds)} "
+                            f"Done - processing took {format_duration(result.elapsed_seconds)} "
                             f"(final export stage: {format_duration(result.export_elapsed_seconds) or '0s'}); "
                             f"{result.rows_kept:,} rows in combined.csv.")
 
@@ -392,10 +400,10 @@ with tab_process:
         if not result.cancelled and not result.combined.empty:
             if report is not None:
                 if report.passed:
-                    st.success("🟢 Validation PASSED — no missing rows or unexplained "
+                    st.success("Validation PASSED - no missing rows or unexplained "
                                "differences between sources and combined.csv.")
                 else:
-                    st.error("🔴 Validation FAILED — see the Validation / Compare tab "
+                    st.error("Validation FAILED - see the Validation / Compare tab "
                              "for details (you can still inspect and download the output).")
 
         # Requirement: summary counts + errors/warnings.
@@ -433,17 +441,17 @@ with tab_process:
         # Errors / warnings block (collapsible so it doesn't dominate the page).
         problems = list(result.errors)
         if problems:
-            with st.expander(f"⚠️ Errors / warnings ({len(problems)})", expanded=True):
+            with st.expander(f"Errors / warnings ({len(problems)})", expanded=True):
                 for p in problems:
                     st.text(p)
         else:
-            st.success("No errors — every readable CSV was processed.")
+            st.success("No errors - every readable CSV was processed.")
 
         # Skipped-files quick view (Requirement: show skipped files + reasons).
         skipped = [r for r in result.per_file_log
                    if r["status"] in ("skipped", "error", "no_csv")]
         if skipped:
-            with st.expander(f"🚫 Skipped / failed files ({len(skipped)})", expanded=False):
+            with st.expander(f"Skipped / failed files ({len(skipped)})", expanded=False):
                 st.dataframe(pd.DataFrame(skipped), use_container_width=True, hide_index=True)
 
         # Per-file log: which ZIP/CSV produced what, and why anything was skipped.
@@ -471,7 +479,7 @@ with tab_process:
                 st.session_state["_csv_bytes"] = write_combined_csv(result.combined)
                 st.session_state["_csv_bytes_for"] = id(result)
             st.download_button(
-                label="⬇️ Download combined.csv",
+                label="Download combined.csv",
                 data=st.session_state["_csv_bytes"],
                 file_name="combined.csv",
                 mime="text/csv",
@@ -479,38 +487,31 @@ with tab_process:
             )
     else:
         # First-load guidance when nothing has been processed yet.
-        st.info("👈 Upload one or more ZIP files in the sidebar and press **Process**.")
+        st.info("Upload one or more files above in this tab and press **Process**.")
 
 # ---------------------------------------------------------------------------
-# Validation / Compare tab — ALWAYS visible and interactive.
-# The user uploads a combined CSV + raw ZIP file(s) directly here and presses
-# "Validate & Compare"; no prior Process-tab run is required.  If inputs are
-# missing, the tab stays open with a helper message and only the button is
-# disabled.
+# Validation / Compare tab — ALWAYS visible.  NO file uploaders here: the
+# tab reuses the source files stored in st.session_state by the Process tab
+# (and the combined CSV produced by the last Process run).  If no files are
+# available, a clear message tells the user to upload in the Process tab.
 # ---------------------------------------------------------------------------
 with tab_validation:
     st.subheader("Validate & Compare")
     st.markdown(
-        "Upload a combined CSV file and one or more ZIP files containing the "
-        "raw CSVs, then press **Validate & Compare**. This works standalone — "
-        "you do not need to run the Process tab first."
+        "Compares the source rows uploaded in the **Process** tab against the "
+        "combined CSV using the key (timestamp, kind, area) — falling back to "
+        "(timestamp, kind, source_csv, tag/title) when area is unavailable. "
+        "Rows with missing/non-numeric values, unparseable timestamps, "
+        "separator artifacts and exact duplicates are reported as valid skips, "
+        "not as missing data."
     )
 
-    # ---- Independent uploaders (never locked, never depend on Process) ----
-    val_combined_upload = st.file_uploader(
-        "Combined CSV file",
-        type=["csv"],
-        key="val_combined_csv",
-        help="The combined output CSV (columns: timestamp, kind, area, value, "
-             "optionally source_zip, source_csv).",
-    )
-    val_zip_uploads = st.file_uploader(
-        "Raw ZIP file(s) containing CSVs",
-        type=["zip"],
-        accept_multiple_files=True,
-        key="val_zip_files",
-        help="One or more ZIP archives with the original raw CSV files.",
-    )
+    session_sources = st.session_state.get("source_files") or []
+
+    if not session_sources:
+        st.info("No files available. Please upload files in the Process tab "
+                "first, then return here to validate.")
+
     val_tolerance = st.number_input(
         "Numeric comparison tolerance (absolute)",
         min_value=0.0,
@@ -520,26 +521,14 @@ with tab_validation:
         help="Values differing by less than this count as equal.",
     )
 
-    # ---- Helper message + disabled button when inputs are missing ----------
-    # (Requirement: never lock the tab; only disable the button.)
-    missing_inputs = []
-    if val_combined_upload is None:
-        missing_inputs.append("a combined CSV file")
-    if not val_zip_uploads:
-        missing_inputs.append("at least one raw ZIP file")
-
     val_running = (st.session_state.get("manual_val_thread") is not None
                    and st.session_state["manual_val_thread"].is_alive())
-
-    if missing_inputs:
-        st.info("To validate, please upload " + " and ".join(missing_inputs) +
-                ". The Validate & Compare button will activate once both are present.")
 
     validate_clicked = st.button(
         "Validate & Compare",
         type="primary",
         use_container_width=True,
-        disabled=bool(missing_inputs) or val_running,
+        disabled=not session_sources or val_running,
     )
 
     if validate_clicked:
@@ -548,12 +537,29 @@ with tab_validation:
         st.session_state.pop("manual_val_error", None)
         st.session_state["manual_val_done"] = False
 
+        # Combined CSV: prefer the file produced by the last Process run;
+        # otherwise fall back to any ZIP/CSV pair that looks like a combined
+        # output already stored in session state.
+        combined_items = []
+        if st.session_state.get("_csv_bytes_for") == id(result):
+            combined_items = [UploadStub("combined.csv",
+                                         st.session_state["_csv_bytes"])]
+        else:
+            for name, payload in session_sources:
+                head = payload[:4]
+                low = str(name).lower()
+                if head != b"PK\x03\x04" and ("combined" in low
+                                              or low.endswith(".csv")):
+                    combined_items.append(UploadStub(name, payload))
+
         tracker = ProgressTracker(total_files=0, total_rows_hint=0)
         st.session_state["manual_val_tracker"] = tracker
-        zip_items = [(u.name, u.getvalue()) for u in val_zip_uploads]
+        # Source items come straight from session state — ZIP payloads or
+        # plain CSV bytes are both handled by the validation engine.
+        source_items = list(session_sources)
         st.session_state["manual_val_thread"] = threading.Thread(
             target=_manual_validation_worker,
-            args=([val_combined_upload], zip_items, float(val_tolerance), tracker),
+            args=(combined_items, source_items, float(val_tolerance), tracker),
             daemon=True)
 
         # Live progress containers repainted in place by _render_progress.

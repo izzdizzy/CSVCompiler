@@ -81,6 +81,7 @@ class ManualValidationReport:
     """
 
     passed: bool = False
+    total_source_files: int = 0      # source CSV files scanned from uploads
     total_combined_rows: int = 0     # valid data rows parsed from combined CSV
     total_raw_rows: int = 0          # cleaned valid rows parsed from ZIP CSVs
     missing_count: int = 0           # raw rows absent from the combined CSV
@@ -135,6 +136,39 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     else:
         df.to_csv(buf, index=False)
     return buf.getvalue()
+
+
+class UploadStub:
+    """File-like wrapper over (name, bytes) pairs stored in st.session_state.
+
+    The Validation / Compare tab reuses the files uploaded in the Process tab
+    (kept as raw bytes in session state); ``read_combined_csv_chunks`` and the
+    combined-CSV reader only need ``.name`` and ``.read()``, which this stub
+    provides without any additional uploader widget.
+    """
+
+    def __init__(self, name: str, payload: bytes):
+        self.name = name
+        self._payload = payload
+        self._pos = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            out = self._payload[self._pos:]
+            self._pos = len(self._payload)
+        else:
+            out = self._payload[self._pos:self._pos + size]
+            self._pos += len(out)
+        return out
+
+    def getvalue(self) -> bytes:
+        return self._payload
+
+    def seek(self, offset: int = 0) -> None:
+        self._pos = max(int(offset), 0)
+
+    def tell(self) -> int:
+        return self._pos
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +247,20 @@ def clean_raw_dataframe(df: pd.DataFrame):
     if not skipped.empty:
         skipped["reason"] = work.loc[bad_mask, "_reason"].values
 
-    valid = work.loc[~bad_mask, ["timestamp", "kind", "area", "_value_num"] +
-                    [c for c in ("source_zip", "source_csv") if c in work.columns]].copy()
+    keep_cols = (["timestamp", "kind", "area", "_value_num"]
+                 + [c for c in ("source_zip", "source_csv", "tag_title")
+                    if c in work.columns])
+    valid = work.loc[~bad_mask, keep_cols].copy()
+    # tag/title fallback column: derive from the raw 'title'/'tag' columns or
+    # from 'area' (the processor stores the tag/title text as area when the
+    # filename gives no area) so the fallback comparison key always works.
+    if "tag_title" not in valid.columns:
+        for cand in ("title", "tag"):
+            if cand in work.columns:
+                valid["tag_title"] = work.loc[~bad_mask, cand].map(_norm_key_str)
+                break
+        else:
+            valid["tag_title"] = valid["area"]
     valid["value"] = valid["_value_num"]
     valid = valid.drop(columns=["_value_num"])
 
@@ -248,7 +294,10 @@ def clean_raw_dataframe(df: pd.DataFrame):
             clean = deduped.drop(index=drop_idx)
 
     clean = clean.sort_values(key_cols, kind="mergesort").reset_index(drop=True)
-    return (clean[key_cols + ["value"]],
+    out_cols = key_cols + ["value"]
+    extra_out = [c for c in ("source_zip", "source_csv", "tag_title")
+                 if c in clean.columns and c not in out_cols]
+    return (clean[out_cols + extra_out],
             skipped.reset_index(drop=True),
             conflicts_df.reset_index(drop=True))
 
@@ -333,10 +382,16 @@ def read_combined_csv_chunks(upload, chunksize: int = COMBINED_CHUNKSIZE):
 # ---------------------------------------------------------------------------
 
 
-def load_raw_from_zips(zip_items, progress=None):
-    """Parse every CSV inside the uploaded ZIPs into one raw DataFrame.
+def _looks_like_zip(payload: bytes) -> bool:
+    return payload[:4] == b"PK\x03\x04"
 
-    `zip_items` is an iterable of ``(zip_name, zip_bytes)`` pairs.
+
+def load_raw_from_zips(source_items, progress=None):
+    """Parse every source file (ZIP archives or plain CSVs) into one raw DataFrame.
+
+    `source_items` is an iterable of ``(name, payload)`` pairs; payloads may be
+    ZIP bytes OR raw CSV bytes (the Process tab stores its uploads in
+    ``st.session_state``, and users may also upload loose CSVs directly).
     Robustness guarantees:
       * corrupt ZIPs / unreadable entries never crash — they are recorded in
         ``skipped_df`` and parsing continues with the remaining files;
@@ -375,13 +430,21 @@ def load_raw_from_zips(zip_items, progress=None):
                 pass
 
     def _file_done(status):
-        """Advance the file-based progress bar (no-op without a tracker)."""
+        """Advance the file-based progress bar (no-op without a tracker).
+
+        Also refreshes the *weighted* overall fraction so callers that blend
+        file completion with fixed pipeline stages (the validation engine)
+        keep a monotonic bar even before every source file count is known.
+        """
         if progress is not None:
             try:
+                # finish_file() ticks the file counter AND (in weighted mode)
+                # refreshes the blended overall fraction automatically.
                 progress.finish_file(status=status)
             except Exception:
                 pass
 
+    zip_items = list(source_items)   # normalise once (iterables are exhausted)
     items = sorted(zip_items, key=lambda t: str(t[0]))
 
     # ---- Pre-scan: count ALL CSV entries up front ------------------------
@@ -392,20 +455,69 @@ def load_raw_from_zips(zip_items, progress=None):
         total_csvs = 0
         for _name, payload in items:
             try:
-                with zipfile.ZipFile(io.BytesIO(payload)) as zf_pre:
-                    total_csvs += sum(1 for finfo in zf_pre.infolist()
-                                      if finfo.filename.lower().endswith(".csv")
-                                      and not finfo.filename.endswith("/"))
+                if _looks_like_zip(payload):
+                    with zipfile.ZipFile(io.BytesIO(payload)) as zf_pre:
+                        total_csvs += sum(1 for finfo in zf_pre.infolist()
+                                          if finfo.filename.lower().endswith(".csv")
+                                          and not finfo.filename.endswith("/"))
+                else:
+                    total_csvs += 1  # a plain CSV upload is one file
             except Exception:
                 continue
         if total_csvs:
-            progress._total_files = total_csvs
+            progress.set_total_files(total_csvs)
 
-    file_index = 0  # 1-based counter across all CSVs in all ZIPs ("file i of N")
+    file_index = 0  # 1-based counter across all CSVs in all sources ("file i of N")
     for zi, (zip_name, payload) in enumerate(items):
         zip_name = str(zip_name)
         if progress is not None:
-            progress.stage(f"📦 Reading ZIP '{zip_name}' ({zi + 1}/{len(items)})…")
+            progress.stage(f"Reading source '{zip_name}' ({zi + 1}/{len(items)})...")
+
+        # ---- Plain CSV upload (no ZIP wrapper) ----------------------------
+        if not _looks_like_zip(payload):
+            inner_name = os.path.basename(zip_name) or "data.csv"
+            if not inner_name.lower().endswith(".csv"):
+                inner_name += ".csv"
+            file_index += 1
+            if progress is not None:
+                try:
+                    progress.set_current_file(zip_name, inner_name, file_index)
+                except Exception:
+                    pass
+            status = "error"
+            area_from_name = re.sub(r"\.csv$", "", inner_name, flags=re.IGNORECASE)
+            if not area_from_name or not re.search(r"[A-Za-z0-9]", area_from_name):
+                area_from_name = None
+            try:
+                rows = read_csv_bytes(payload)
+                ts_col = None
+                for r0 in rows[:5]:
+                    norm0 = [str(c).strip().lower() for c in r0]
+                    if "timestamp" in norm0:
+                        ts_col = norm0.index("timestamp")
+                        break
+                kind = infer_kind(zip_name, log_fn)
+                df, rows_read, err, art = process_csv_rows(
+                    rows, kind, area_from_name, zip_name, inner_name,
+                    log_fn, ts_col=ts_col, progress=progress)
+                for k in totals:
+                    totals[k] += getattr(art, k)
+                if df is None or df.empty:
+                    status = "skipped"
+                    skipped_rows.append(dict(file=zip_name, entry=inner_name,
+                                             reason=err or "empty file or no valid rows"))
+                else:
+                    status = "ok"
+                    frames.append(df)
+            except Exception as e:
+                skipped_rows.append(dict(
+                    file=zip_name, entry=inner_name,
+                    reason=f"error reading CSV: {type(e).__name__}: {e}"))
+            finally:
+                _file_done(status)
+            continue
+
+        # ---- ZIP archive ---------------------------------------------------
         try:
             zf = zipfile.ZipFile(io.BytesIO(payload))
         except Exception as e:
@@ -491,10 +603,15 @@ def load_raw_from_zips(zip_items, progress=None):
 # ---------------------------------------------------------------------------
 
 
-def run_manual_validation(combined_uploads, zip_items,
+def run_manual_validation(combined_uploads, source_items,
                           tolerance: float = DEFAULT_VALIDATION_TOLERANCE,
                           progress=None) -> ManualValidationReport:
-    """Validate uploaded combined CSV file(s) against uploaded ZIP file(s).
+    """Validate uploaded combined CSV file(s) against the source data.
+
+    ``source_items`` is an iterable of ``(name, payload)`` pairs where the
+    payload may be ZIP bytes OR raw CSV bytes (the Process tab stores its
+    uploads in ``st.session_state`` as CSV files, so the Validation / Compare
+    tab can reuse them directly without any separate uploader).
 
     Stateless: uses ONLY the files handed to this call — never session state
     or results from the Process tab (requirement 3).
@@ -522,9 +639,36 @@ def run_manual_validation(combined_uploads, zip_items,
         if progress is not None:
             progress.stage(msg)
 
+    # ---- Live-progress weighting ----------------------------------------
+    # The primary bar is driven by SOURCE CSV FILE COMPLETION (the long,
+    # per-file scanning phase owns 86% of the bar).  Fixed pipeline stages
+    # (loading/indexing the combined CSV, comparing rows, generating the
+    # report) each claim a small slice so the bar always moves forward and
+    # never sits at 0% while the combined file is being read.
+    source_items = list(source_items)       # normalise once (iterables exhaust)
+    if progress is not None:
+        try:
+            progress.enable_weighted_progress(scan_span=0.86)
+        except Exception:
+            pass
+    _STAGE_WEIGHTS = {"load": 0.03, "index": 0.03, "scan": 0.02,
+                     "compare": 0.04, "report": 0.04}
+    _stage_done = set()
+
+    def set_stage(name):
+        """Mark a fixed pipeline stage complete -> bumps the weighted bar."""
+        if progress is None or name in _stage_done:
+            return
+        _stage_done.add(name)
+        try:
+            progress.set_weighted_stage(_STAGE_WEIGHTS.get(name, 0.0))
+        except Exception:
+            pass
+
     # ==================================================================
     # 1) Parse the uploaded combined CSV(s) — chunked, memory-bounded.
     # ==================================================================
+    stage("Loading combined CSV")
     comb_chunks = []
     comb_skipped = []          # invalid combined rows (per-row reasons)
     comb_total_valid = 0       # valid data rows found in combined files
@@ -562,18 +706,18 @@ def run_manual_validation(combined_uploads, zip_items,
                 elif has_src_cols_seen and not src_ok:
                     # Mixed layouts across files: fall back to global matching.
                     has_src_cols_seen = False
-                    stage("⚠️ Combined files have inconsistent source columns — "
+                    stage("Combined files have inconsistent source columns - "
                           "falling back to global key matching")
         except ValueError as e:
             # Structural problem (empty file / wrong columns): report clearly.
             rep.issues.append(str(e))
             comb_skipped.append(pd.DataFrame(
                 [{"file": name, "reason": f"unreadable combined CSV: {e}"}]))
-            stage(f"❌ {e}")
+            stage(f" {e}")
         except Exception as e:  # never crash the app on one bad upload
             rep.issues.append(f"Unexpected error reading '{name}': "
                               f"{type(e).__name__}: {e}")
-            stage(f"❌ Unexpected error reading '{name}': {e}")
+            stage(f" Unexpected error reading '{name}': {e}")
 
     rep.has_source_cols = bool(has_src_cols_seen)
     if comb_chunks:
@@ -588,17 +732,27 @@ def run_manual_validation(combined_uploads, zip_items,
         skipped_comb = pd.DataFrame()
     stage(f"Combined CSV parsed: {comb_total_valid:,} valid row(s), "
           f"{comb_total_invalid:,} invalid/skipped row(s)")
+    set_stage("load")
+
+    # ---- Stage: indexing the combined CSV ---------------------------------
+    # A set-like lookup over the composite key is what makes the per-source
+    # file comparison O(1) per row instead of a table scan every time.
+    stage("Indexing combined CSV")
+    set_stage("index")
 
     # ==================================================================
-    # 2) Parse + clean the raw data from the uploaded ZIPs.
+    # 2) Parse + clean the raw data from the uploaded source ZIPs.
     # ==================================================================
-    stage("Reading uploaded ZIP archives…")
+    stage("Scanning source CSV files")
     raw_all, skipped_zip_files, zip_artifacts = load_raw_from_zips(
-        zip_items, progress=progress)
-    stage(f"ZIP scan finished: {len(raw_all):,} pre-clean row(s) from "
-          f"{len(zip_items)} ZIP(s)")
+        source_items, progress=progress)
+    _pt_total = progress.snapshot()["total_files"] if progress is not None else 0
+    rep.total_source_files = max(int(_pt_total), len(source_items))
+    stage(f"Source scan finished: {len(raw_all):,} pre-clean row(s) from "
+          f"{rep.total_source_files} source file(s)")
 
-    # Apply the shared cleaning rules (requirement 6) to the raw ZIP data.
+    # Apply the shared cleaning rules (requirement 6) to the source data.
+    set_stage("scan")
     raw_clean, skipped_raw_rows, raw_conflicts = clean_raw_dataframe(raw_all)
     del raw_all  # release the pre-clean frame as soon as possible
     rep.total_raw_rows = int(len(raw_clean))
@@ -606,16 +760,57 @@ def run_manual_validation(combined_uploads, zip_items,
     # ==================================================================
     # 3) Compare combined vs cleaned raw on the composite key.
     # ==================================================================
+    stage("Comparing rows")
     tol = abs(float(tolerance))
     scope_cols = ["source_zip", "source_csv"] if rep.has_source_cols else []
-    key_cols = ["timestamp", "kind", "area"] + scope_cols
+
+    # ---- Decide the comparison key ----------------------------------------
+    # Primary key: (timestamp, kind, area).  If NEITHER side provides usable
+    # area values (combined CSV has no 'area' column at all), fall back to
+    # (timestamp, kind, source_csv, tag/title) so rows can still be matched.
+    comb_has_area = ("area" in combined.columns
+                     and not combined["area"].map(_norm_key_str).eq("").all())
+    raw_has_area = (not raw_clean.empty
+                    and "area" in raw_clean.columns
+                    and not raw_clean["area"].map(_norm_key_str).eq("").all())
+    use_area_key = bool(comb_has_area or raw_has_area)
+    if use_area_key:
+        key_cols = ["timestamp", "kind", "area"] + scope_cols
+    else:
+        key_cols = ["timestamp", "kind", "source_csv", "tag_title"]
+        stage("Fallback comparison key in use: "
+              "(timestamp, kind, source_csv, tag/title) — no area column found")
+
+    # Guarantee every key column exists on both frames (missing -> '').
+    for _c in key_cols:
+        if _c not in raw_clean.columns:
+            raw_clean[_c] = ""
+        if _c not in combined.columns:
+            combined[_c] = ""
 
     def make_keys(df: pd.DataFrame) -> pd.Series:
-        """Composite key string -> hashed digest Series for cheap joins."""
+        """Composite key string -> hashed digest Series for cheap joins.
+
+        Comparison key (requirement): (timestamp, kind, area).  When the
+        combined CSV lacks an ``area`` column entirely, the fallback key is
+        (timestamp, kind, source_csv, tag/title) — the raw side always
+        carries both of those columns (the parser fills ``source_csv`` and
+        uses the tag/title text as the area fallback), so the fallback is
+        applied automatically when either side has no usable area values.
+        """
         ts = pd.to_datetime(df["timestamp"], errors="coerce").astype(str)
-        parts = [ts.fillna(""), df["kind"].astype(str), df["area"].astype(str)]
-        for c in scope_cols:
-            parts.append(df[c].fillna("").astype(str))
+        if use_area_key:
+            parts = [ts.fillna(""), df["kind"].astype(str), df["area"].astype(str)]
+            for c in scope_cols:
+                parts.append(df[c].fillna("").astype(str))
+        else:
+            # Fallback key: timestamp | kind | source_csv | tag/title
+            parts = [ts.fillna(""), df["kind"].astype(str)]
+            sc = df["source_csv"].fillna("").astype(str) \
+                if "source_csv" in df.columns else pd.Series("", index=df.index)
+            tg = df["tag_title"].fillna("").astype(str) \
+                if "tag_title" in df.columns else pd.Series("", index=df.index)
+            parts.extend([sc, tg])
         return _key_digest(pd.concat(parts, axis=1).agg("|".join, axis=1))
 
     # The RAW side always carries source_zip/source_csv, but the CLEANED frame
@@ -637,14 +832,16 @@ def run_manual_validation(combined_uploads, zip_items,
     # whenever a key exists on only one side (missing / unexpected rows).
     # Hash the digest back to a compact per-side "key" string so every report
     # table shows timestamp/kind/area even for one-sided rows.
-    raw_d2k = (raw_view.drop_duplicates("_key")
-               .set_index("_key")["timestamp"].astype(str) + "|"
-               + raw_view.drop_duplicates("_key").set_index("_key")["kind"]
-               + "|" + raw_view.drop_duplicates("_key").set_index("_key")["area"])
-    comb_d2k = (comb_view.drop_duplicates("_key")
-                .set_index("_key")["timestamp"].astype(str) + "|"
-                + comb_view.drop_duplicates("_key").set_index("_key")["kind"]
-                + "|" + comb_view.drop_duplicates("_key").set_index("_key")["area"])
+    def _d2k(view):
+        """digest -> readable 'ts|kind|area-or-fallback' map for report tables."""
+        v = view.drop_duplicates("_key").set_index("_key")
+        out = v["timestamp"].astype(str) + "|" + v["kind"].astype(str)
+        for c in key_cols[2:]:
+            out = out + "|" + v[c].astype(str)
+        return out
+
+    raw_d2k = _d2k(raw_view)
+    comb_d2k = _d2k(comb_view)
 
     # ---- Raw-side duplicate conflicts (already grouped by cleaner) -------
     conf_frames = []
@@ -720,6 +917,8 @@ def run_manual_validation(combined_uploads, zip_items,
                 mismatch_rows.append({**base, "raw_value": None,
                                       "combined_value": w})
 
+    stage("Generating validation report")
+    set_stage("compare")
     rep.missing_df = pd.DataFrame(missing_rows,
                                   columns=key_cols + ["value"])
     rep.unexpected_df = pd.DataFrame(unexpected_rows,
@@ -730,22 +929,20 @@ def run_manual_validation(combined_uploads, zip_items,
 
     # ---- Combined-side duplicate conflicts (same key, different values) ---
     if not combined.empty:
-        cc_dup_mask = combined.duplicated(subset=["timestamp", "kind", "area"],
-                                          keep=False)
+        cc_dup_mask = combined.duplicated(subset=key_cols, keep=False)
         if cc_dup_mask.any():
             cc = combined[cc_dup_mask].copy()
-            grp = cc.groupby(["timestamp", "kind", "area"], sort=False,
-                             observed=True).ngroup() + 1
+            grp = cc.groupby(key_cols, sort=False, observed=True).ngroup() + 1
             # Only genuine VALUE conflicts count (identical values are just
             # exact duplicates, tolerated in global matching mode).
-            vary = (cc.groupby(["timestamp", "kind", "area"], observed=True)["value"]
+            vary = (cc.groupby(key_cols, observed=True)["value"]
                     .transform(lambda s: s.nunique() > 1))
             cc = cc[vary.astype(bool)].copy()
             if not cc.empty:
                 cc["conflict_group"] = grp[cc.index]
                 cc["side"] = "combined csv"
-                conf_frames.append(cc[["timestamp", "kind", "area", "value",
-                                       "conflict_group", "side"]])
+                conf_frames.append(cc[key_cols + ["value", "conflict_group",
+                                                  "side"]])
 
     if conf_frames:
         cd = pd.concat(conf_frames, ignore_index=True)
@@ -835,8 +1032,8 @@ def run_manual_validation(combined_uploads, zip_items,
 
     if not combined_uploads:
         rep.issues.append("No combined CSV files were uploaded.")
-    if not zip_items:
-        rep.issues.append("No ZIP files were uploaded.")
+    if not source_items:
+        rep.issues.append("No source files are available.")
     if rep.missing_count:
         rep.issues.append(f"{rep.missing_count:,} row(s) present in the cleaned "
                           "ZIP data are MISSING from the combined CSV.")
@@ -875,20 +1072,27 @@ def run_manual_validation(combined_uploads, zip_items,
     rep.passed = not rep.issues
 
     rep.summary_df = pd.DataFrame([
-        dict(metric="Pass/Fail status", value="PASS" if rep.passed else "FAIL"),
-        dict(metric="Combined CSV rows uploaded (valid)", value=rep.total_combined_rows),
-        dict(metric="Cleaned raw rows from ZIP files", value=rep.total_raw_rows),
-        dict(metric="Missing rows (in ZIP, not in combined)", value=rep.missing_count),
-        dict(metric="Unexpected rows (in combined, not in ZIP)", value=rep.unexpected_count),
+        dict(metric="Validation status", value="PASS" if rep.passed else "FAIL"),
+        dict(metric="Total source files", value=rep.total_source_files),
+        dict(metric="Total valid source rows", value=rep.total_raw_rows),
+        dict(metric="Total combined rows", value=rep.total_combined_rows),
+        dict(metric="Rows missing without valid reason", value=rep.missing_count),
+        dict(metric="Rows skipped for valid reasons", value=rep.skipped_invalid_count),
+        dict(metric="Unexpected rows", value=rep.unexpected_count),
         dict(metric="Value mismatches", value=rep.mismatch_count),
         dict(metric="Duplicate conflict groups", value=rep.conflict_count),
-        dict(metric="Skipped invalid rows", value=rep.skipped_invalid_count),
-        dict(metric="Skipped files", value=rep.skipped_files_count),
+        dict(metric="Skipped files (no valid rows)", value=rep.skipped_files_count),
         dict(metric="Numeric tolerance", value=rep.tolerance),
         dict(metric="Source columns present in combined CSV",
              value="yes" if rep.has_source_cols else "no"),
         dict(metric="Validation duration (s)",
              value=round(time.monotonic() - t0, 3)),
     ])
+    set_stage("report")
+    if progress is not None:
+        try:
+            progress.finish_all_files()   # weighted fraction -> 1.0
+        except Exception:
+            pass
     rep.elapsed_seconds = time.monotonic() - t0
     return rep
